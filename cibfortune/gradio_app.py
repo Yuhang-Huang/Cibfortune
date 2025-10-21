@@ -14,6 +14,8 @@ import requests
 from io import BytesIO
 import time
 import json
+import csv
+from datetime import datetime
 
 # 设置环境变量
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -27,6 +29,9 @@ class Qwen3VLGradioApp:
         self.model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
         self.is_loaded = False
         self.chat_history = []
+        self.chat_messages = []
+        self.last_image = None
+        self.last_ocr_markdown = None
         
     def load_model(self, progress=gr.Progress()):
         """加载模型"""
@@ -56,219 +61,314 @@ class Qwen3VLGradioApp:
         except Exception as e:
             return f"❌ 模型加载失败: {str(e)}"
     
-    def chat_with_image(self, image, text, history, max_tokens, temperature):
-        """与图像对话"""
-        if not self.is_loaded:
-            return history, "❌ 请先加载模型！"
-        
-        if image is None:
-            return history, "❌ 请上传图像！"
-        
-        if not text.strip():
-            return history, "❌ 请输入问题！"
-        
-        try:
-            # 构建消息
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": text},
-                    ],
-                }
-            ]
-            
-            # 准备输入
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
+    def _prepare_user_message(self, image, prompt):
+        prompt_clean = (prompt or "").strip()
+        resolved_image = image if image is not None else self.last_image
+        if resolved_image is None:
+            raise ValueError("❌ 请上传图像！")
+        if not prompt_clean:
+            raise ValueError("❌ 请输入问题！")
+        if image is not None:
+            self.last_image = image
+        content = [
+            {"type": "image", "image": resolved_image},
+            {"type": "text", "text": prompt_clean},
+        ]
+        return prompt_clean, {"role": "user", "content": content}
+
+    def _run_inference(self, image, prompt, max_tokens, temperature, prepared=None):
+        if prepared is None:
+            prompt_clean, user_message = self._prepare_user_message(image, prompt)
+        else:
+            prompt_clean, user_message = prepared
+        messages = self.chat_messages + [user_message]
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        generation_kwargs = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "do_sample": True if temperature > 0 else False
+        }
+
+        start_time = time.time()
+        with torch.no_grad():
+            generated_ids = self.model.generate(**inputs, **generation_kwargs)
+        generation_time = time.time() - start_time
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        response = output_text[0]
+
+        assistant_message = {"role": "assistant", "content": [{"type": "text", "text": response}]}
+        self.chat_messages.extend([user_message, assistant_message])
+        return prompt_clean, response, generation_time
+
+    def _clone_history(self, history):
+        return [[turn[0], turn[1]] for turn in history]
+
+    def _chunk_response(self, text, chunk_size=80):
+        if not text:
+            return []
+        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    @staticmethod
+    def _parse_markdown_sections(markdown_text):
+        sections = []
+        lines = markdown_text.splitlines()
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            is_table = (
+                stripped.startswith("|")
+                and stripped.count("|") >= 2
+                and i + 1 < len(lines)
+                and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
             )
-            inputs = inputs.to(self.model.device)
-            
-            # 生成回答
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs, 
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    do_sample=True if temperature > 0 else False
+
+            if is_table:
+                header = [cell.strip() for cell in stripped.strip("|").split("|")]
+                i += 2
+                rows = []
+                while i < len(lines):
+                    row_line = lines[i].strip()
+                    if not (row_line.startswith("|") and row_line.count("|") >= 2):
+                        break
+                    row = [cell.strip() for cell in row_line.strip("|").split("|")]
+                    rows.append(row)
+                    i += 1
+                sections.append({"type": "table", "header": header, "rows": rows})
+                continue
+
+            text_block = []
+            while i < len(lines):
+                current = lines[i]
+                stripped_current = current.strip()
+                next_is_table = (
+                    stripped_current.startswith("|")
+                    and stripped_current.count("|") >= 2
+                    and i + 1 < len(lines)
+                    and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
                 )
-            
-            # 处理输出
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = self.processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            
-            response = output_text[0]
-            
-            # 更新历史记录
-            history.append([f"👤 {text}", f"🤖 {response}"])
-            
-            return history, ""
-            
+                if next_is_table:
+                    break
+                text_block.append(current)
+                i += 1
+                if i < len(lines) and lines[i] == "":
+                    text_block.append(lines[i])
+            text_content = "\n".join(text_block).strip("\n")
+            if text_content:
+                sections.append({"type": "text", "text": text_content})
+
+        return sections
+
+    def chat_with_image(self, image, text, history, max_tokens, temperature):
+        """与图像对话（流式反馈）"""
+        original_text = text
+
+        if not self.is_loaded:
+            yield history, original_text
+            return
+
+        try:
+            prepared = self._prepare_user_message(image, text)
+        except ValueError as exc:
+            yield history, original_text
+            return
+
+        prompt_clean, _ = prepared
+        history_copy = self._clone_history(history)
+        history_copy.append([f"👤 {prompt_clean}", "🤖 正在思考..."])
+        yield self._clone_history(history_copy), original_text
+
+        try:
+            _, response, _ = self._run_inference(image, text, max_tokens, temperature, prepared=prepared)
         except Exception as e:
-            error_msg = f"❌ 生成失败: {str(e)}"
-            history.append([f"👤 {text}", error_msg])
-            return history, ""
+            history_copy[-1][1] = f"❌ 生成失败: {str(e)}"
+            self.chat_history = self._clone_history(history_copy)
+            yield self._clone_history(history_copy), original_text
+            return
+
+        assembled = ""
+        chunks = self._chunk_response(response)
+        if not chunks:
+            chunks = [""]
+        for chunk in chunks:
+            assembled += chunk
+            history_copy[-1][1] = f"🤖 {assembled}▌"
+            yield self._clone_history(history_copy), original_text
+
+        history_copy[-1][1] = f"🤖 {response}"
+        final_history = self._clone_history(history_copy)
+        self.chat_history = final_history
+        yield final_history, original_text
     
-    def ocr_analysis(self, image):
+    def ocr_analysis(self, image, prompt: str = None):
         """OCR文字识别"""
         if not self.is_loaded:
             return "❌ 请先加载模型！"
         
-        if image is None:
-            return "❌ 请上传图像！"
+        default_prompt = "请识别并提取这张图片中的所有文字内容。如果图片中有多种语言，请分别标注语言类型。"
+        effective_prompt = (prompt or "").strip() or default_prompt
         
         try:
-            prompt = "请识别并提取这张图片中的所有文字内容。如果图片中有多种语言，请分别标注语言类型。"
-            
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
-            )
-            inputs = inputs.to(self.model.device)
-            
-            with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, max_new_tokens=1024)
-            
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = self.processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            
-            return f"📝 OCR识别结果:\n\n{output_text[0]}"
-            
+            prompt_clean, response, _ = self._run_inference(image, effective_prompt, max_tokens=1024, temperature=0.7)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            self.last_ocr_markdown = f"## OCR识别结果\n\n{response}"
+            return f"📝 OCR识别结果:\n\n{response}"
+        except ValueError as exc:
+            return str(exc)
         except Exception as e:
             return f"❌ OCR识别失败: {str(e)}"
     
-    def spatial_analysis(self, image):
+    def spatial_analysis(self, image, prompt: str = None):
         """空间感知分析"""
         if not self.is_loaded:
             return "❌ 请先加载模型！"
         
-        if image is None:
-            return "❌ 请上传图像！"
-        
-        try:
-            prompt = """请分析这张图片中的空间关系，包括：
+        default_prompt = """请分析这张图片中的空间关系，包括：
             1. 物体的相对位置关系
             2. 视角和观察角度
             3. 物体的遮挡关系
             4. 深度和距离感
             5. 空间布局的整体描述"""
-            
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
-            )
-            inputs = inputs.to(self.model.device)
-            
-            with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, max_new_tokens=1024)
-            
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = self.processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            
-            return f"🔍 空间分析结果:\n\n{output_text[0]}"
-            
+        effective_prompt = (prompt or "").strip() or default_prompt
+        
+        try:
+            prompt_clean, response, _ = self._run_inference(image, effective_prompt, max_tokens=768, temperature=0.7)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            return f"🔍 空间分析结果:\n\n{response}"
+        except ValueError as exc:
+            return str(exc)
         except Exception as e:
             return f"❌ 空间分析失败: {str(e)}"
     
-    def visual_coding(self, image, output_format):
+    def visual_coding(self, image, output_format, prompt: str = None):
         """视觉编程"""
         if not self.is_loaded:
             return "❌ 请先加载模型！"
-        
-        if image is None:
-            return "❌ 请上传图像！"
-        
+
         try:
             format_prompts = {
-                "HTML": "请根据这张图片生成对应的HTML代码，包括结构、样式和布局。",
-                "CSS": "请根据这张图片生成对应的CSS样式代码。",
-                "JavaScript": "请根据这张图片生成对应的JavaScript代码。",
-                "Python": "请根据这张图片生成对应的Python代码。"
+                "HTML": "请根据图片生成对应的HTML结构代码，包含必要的语义标签。",
+                "CSS": "请为该图片对应的界面生成合理的CSS样式代码，包括布局与颜色。",
+                "JavaScript": "请根据图片交互生成JavaScript代码示例，包含必要的事件与逻辑。",
+                "Python": "请生成能复现该界面/布局的Python示例代码（如使用streamlit或flask的伪代码）。",
             }
+            base_prompt = format_prompts.get(output_format, format_prompts["HTML"]) + " 请只输出代码，不要额外说明。"
+            effective_prompt = (prompt or "").strip() or base_prompt
+
+            prompt_clean, response, _ = self._run_inference(image, effective_prompt, max_tokens=2048, temperature=0.4)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            return f"💻 {output_format}代码:\n\n```{output_format.lower()}\n{response}\n```"
             
-            prompt = format_prompts.get(output_format, format_prompts["HTML"])
-            
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ]
-            
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
-            )
-            inputs = inputs.to(self.model.device)
-            
-            with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, max_new_tokens=2048)
-            
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = self.processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            
-            return f"💻 {output_format}代码:\n\n```{output_format.lower()}\n{output_text[0]}\n```"
-            
+        except ValueError as exc:
+            return str(exc)
         except Exception as e:
             return f"❌ 代码生成失败: {str(e)}"
     
     def clear_history(self):
         """清空对话历史"""
         self.chat_history = []
+        self.chat_messages = []
+        self.last_image = None
+        self.last_ocr_markdown = None
         return []
+
+    def export_last_ocr(self):
+        if not getattr(self, "last_ocr_markdown", None):
+            return "❌ 没有可保存的文本样式，请先执行一次OCR识别！"
+
+        export_dir = os.path.join("ocr_exports")
+        os.makedirs(export_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sections = self._parse_markdown_sections(self.last_ocr_markdown)
+
+        word_path = os.path.join(export_dir, f"ocr_{timestamp}.docx")
+        excel_path = os.path.join(export_dir, f"ocr_{timestamp}.xlsx")
+        word_note = ""
+        excel_note = ""
+
+        try:
+            from docx import Document
+
+            doc = Document()
+            doc.add_heading("OCR 识别结果", level=1)
+            for section in sections:
+                if section["type"] == "text":
+                    for paragraph in section["text"].split("\n\n"):
+                        doc.add_paragraph(paragraph)
+                        doc.add_paragraph()
+                else:
+                    header = section["header"]
+                    rows = section["rows"]
+                    table = doc.add_table(rows=len(rows) + 1, cols=len(header))
+                    table.style = "Table Grid"
+                    for idx, title in enumerate(header):
+                        table.cell(0, idx).text = title
+                    for r_idx, row in enumerate(rows, start=1):
+                        for c_idx, cell in enumerate(row):
+                            table.cell(r_idx, c_idx).text = cell
+                    doc.add_paragraph()
+            if not sections:
+                doc.add_paragraph(self.last_ocr_markdown)
+            doc.save(word_path)
+        except Exception as exc:
+            word_path = os.path.join(export_dir, f"ocr_{timestamp}.md")
+            with open(word_path, "w", encoding="utf-8") as f:
+                f.write(self.last_ocr_markdown)
+            word_note = f"⚠️ Word导出失败({exc})，已保存为Markdown"
+
+        try:
+            from openpyxl import Workbook
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "表格1" if sections else "OCR文本"
+            table_idx = 0
+            for section in sections:
+                if section["type"] == "table":
+                    table_idx += 1
+                    if table_idx > 1:
+                        ws = wb.create_sheet(title=f"表格{table_idx}")
+                    ws.append(section["header"])
+                    for row in section["rows"]:
+                        ws.append(row)
+                elif section["type"] == "text" and section["text"]:
+                    if table_idx > 0:
+                        ws = wb.create_sheet(title=f"文本{table_idx}")
+                    for line in section["text"].splitlines():
+                        ws.append([line])
+            if not sections:
+                for line in self.last_ocr_markdown.splitlines():
+                    ws.append([line])
+            wb.save(excel_path)
+        except Exception as exc:
+            excel_path = os.path.join(export_dir, f"ocr_{timestamp}.csv")
+            with open(excel_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["OCR Result"])
+                for line in self.last_ocr_markdown.splitlines():
+                    writer.writerow([line])
+            excel_note = f"⚠️ Excel导出失败({exc})，已保存为CSV"
+
+        message_lines = [
+            "✅ 文本样式已保存：",
+            f"- Word: {word_path}" + (f" ({word_note})" if word_note else ""),
+            f"- Excel: {excel_path}" + (f" ({excel_note})" if excel_note else ""),
+        ]
+        return "\n".join(message_lines)
 
 # 创建应用实例
 app = Qwen3VLGradioApp()
@@ -281,7 +381,7 @@ def create_interface():
         theme=gr.themes.Soft(),
         css="""
         .gradio-container {
-            max-width: 1200px !important;
+            max-width: 1600px !important;
         }
         .chat-message {
             padding: 10px;
@@ -370,10 +470,6 @@ def create_interface():
                 outputs=[chatbot, text_input]
             )
             
-            clear_btn.click(
-                app.clear_history,
-                outputs=[chatbot]
-            )
         
         with gr.Tab("📝 OCR识别"):
             gr.Markdown("### 文字识别")
@@ -393,12 +489,37 @@ def create_interface():
                         lines=15,
                         max_lines=20
                     )
-            
+                    save_style_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
+                    ocr_export_status = gr.Textbox(
+                        label="保存状态",
+                        interactive=False,
+                        lines=2
+                    )
+
+            def _run_ocr(image):
+                result = app.ocr_analysis(image)
+                has_result = not result.startswith("❌")
+                return result, gr.update(interactive=has_result), ""
+
             ocr_btn.click(
-                app.ocr_analysis,
+                _run_ocr,
                 inputs=[ocr_image],
-                outputs=[ocr_result]
+                outputs=[ocr_result, save_style_btn, ocr_export_status]
             )
+
+            save_style_btn.click(
+                app.export_last_ocr,
+                outputs=[ocr_export_status]
+            )
+
+        def _clear_all():
+            app.clear_history()
+            return [], gr.update(interactive=False), ""
+
+        clear_btn.click(
+            _clear_all,
+            outputs=[chatbot, save_style_btn, ocr_export_status]
+        )
         
         with gr.Tab("🔍 空间分析"):
             gr.Markdown("### 空间感知分析")
@@ -501,6 +622,8 @@ def main():
     # 创建界面
     interface = create_interface()
     
+    interface.queue()
+
     # 启动服务
     interface.launch(
         server_name="0.0.0.0",  # 允许外部访问

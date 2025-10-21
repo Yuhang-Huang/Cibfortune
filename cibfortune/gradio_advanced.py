@@ -15,6 +15,7 @@ from io import BytesIO
 import time
 import json
 import base64
+import csv
 from datetime import datetime
 
 # 设置环境变量
@@ -30,6 +31,11 @@ class AdvancedQwen3VLApp:
         self.is_loaded = False
         self.chat_history = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.chat_messages = []
+        self.last_image = None
+        self.last_saved_image_path = None
+        self.last_image_digest = None
+        self.last_ocr_markdown = None
         
     def load_model(self, progress=gr.Progress()):
         """加载模型"""
@@ -59,79 +65,265 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             return f"❌ 模型加载失败: {str(e)}", gr.update(interactive=False)
     
+    def _prepare_user_message(self, image, prompt):
+        prompt_clean = (prompt or "").strip()
+        resolved_image = image if image is not None else self.last_image
+        if resolved_image is None:
+            raise ValueError("❌ 请上传图像！")
+        if not prompt_clean:
+            raise ValueError("❌ 请输入问题！")
+        if image is not None:
+            self.last_image = image
+        content = [
+            {"type": "image", "image": resolved_image},
+            {"type": "text", "text": prompt_clean},
+        ]
+        return prompt_clean, {"role": "user", "content": content}
+
+    def _run_inference(self,
+                       image,
+                       prompt,
+                       max_tokens,
+                       temperature,
+                       top_p,
+                       top_k,
+                       repetition_penalty,
+                       prepared=None):
+        if prepared is None:
+            prompt_clean, user_message = self._prepare_user_message(image, prompt)
+        else:
+            prompt_clean, user_message = prepared
+        messages = self.chat_messages + [user_message]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        generation_kwargs = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "do_sample": True if temperature > 0 else False,
+            "repetition_penalty": repetition_penalty
+        }
+
+        start_time = time.time()
+        with torch.no_grad():
+            generated_ids = self.model.generate(**inputs, **generation_kwargs)
+        generation_time = time.time() - start_time
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        response = output_text[0]
+
+        assistant_message = {"role": "assistant", "content": [{"type": "text", "text": response}]}
+        self.chat_messages.extend([user_message, assistant_message])
+        return prompt_clean, response, generation_time
+
+    def _clone_history(self, history):
+        return [[turn[0], turn[1]] for turn in history]
+
+    def _chunk_response(self, text, chunk_size=80):
+        if not text:
+            return []
+        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    @staticmethod
+    def _parse_markdown_sections(markdown_text):
+        sections = []
+        lines = markdown_text.splitlines()
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            is_table = (
+                stripped.startswith("|")
+                and stripped.count("|") >= 2
+                and i + 1 < len(lines)
+                and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
+            )
+
+            if is_table:
+                header = [cell.strip() for cell in stripped.strip("|").split("|")]
+                i += 2  # skip header and separator
+                rows = []
+                while i < len(lines):
+                    row_line = lines[i].strip()
+                    if not (row_line.startswith("|") and row_line.count("|") >= 2):
+                        break
+                    row = [cell.strip() for cell in row_line.strip("|").split("|")]
+                    rows.append(row)
+                    i += 1
+                sections.append({"type": "table", "header": header, "rows": rows})
+                continue
+
+            text_block = []
+            while i < len(lines):
+                current = lines[i]
+                stripped_current = current.strip()
+                next_is_table = (
+                    stripped_current.startswith("|")
+                    and stripped_current.count("|") >= 2
+                    and i + 1 < len(lines)
+                    and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
+                )
+                if next_is_table:
+                    break
+                text_block.append(current)
+                i += 1
+                if i < len(lines) and lines[i] == "":
+                    text_block.append(lines[i])
+            text_content = "\n".join(text_block).strip("\n")
+            if text_content:
+                sections.append({"type": "text", "text": text_content})
+
+        return sections
+
     def chat_with_image(self, image, text, history, max_tokens, temperature, top_p, top_k, repetition_penalty: float = 1.0, presence_penalty: float = 1.5):
-        """与图像对话"""
+        """与图像对话（流式反馈）"""
+        original_text = text
+
         if not self.is_loaded:
-            return history, "❌ 请先加载模型！", ""
-        
-        if image is None:
-            return history, "❌ 请上传图像！", ""
-        
-        if not text.strip():
-            return history, "❌ 请输入问题！", ""
-        
+            yield history, original_text, "❌ 请先加载模型！"
+            return
+
         try:
-            # 构建消息
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": text},
-                    ],
-                }
-            ]
-            
-            # 准备输入
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
+            prepared = self._prepare_user_message(image, text)
+        except ValueError as exc:
+            yield history, original_text, str(exc)
+            return
+
+        prompt_clean, _ = prepared
+        history_copy = self._clone_history(history)
+        history_copy.append([f"👤 {prompt_clean}", "🤖 正在思考..."])
+        yield self._clone_history(history_copy), original_text, "🤖 正在思考..."
+
+        try:
+            _, response, generation_time = self._run_inference(
+                image,
+                text,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                prepared=prepared
             )
-            inputs = inputs.to(self.model.device)
-            
-            # 生成参数
-            generation_kwargs = {
-                "max_new_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "do_sample": True if temperature > 0 else False,
-                "repetition_penalty": repetition_penalty
-                # presence_penalty 参数为 OpenAI 风格，Transformers 不原生支持，此处保留占位
-            }
-            
-            # 生成回答
-            start_time = time.time()
-            with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, **generation_kwargs)
-            
-            generation_time = time.time() - start_time
-            
-            # 处理输出
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = self.processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            
-            response = output_text[0]
-            
-            # 更新历史记录
-            history.append([f"👤 {text}", f"🤖 {response}"])
-            
-            # 生成统计信息
-            stats = f"⏱️ 生成时间: {generation_time:.2f}秒 | 📝 生成长度: {len(response)}字符"
-            
-            return history, "", stats
-            
         except Exception as e:
-            error_msg = f"❌ 生成失败: {str(e)}"
-            history.append([f"👤 {text}", error_msg])
-            return history, "", f"❌ 错误: {str(e)}"
+            history_copy[-1][1] = f"❌ 生成失败: {str(e)}"
+            self.chat_history = self._clone_history(history_copy)
+            yield self._clone_history(history_copy), original_text, f"❌ 错误: {str(e)}"
+            return
+
+        assembled = ""
+        chunks = self._chunk_response(response)
+        if not chunks:
+            chunks = [""]
+        for chunk in chunks:
+            assembled += chunk
+            history_copy[-1][1] = f"🤖 {assembled}▌"
+            yield self._clone_history(history_copy), original_text, "🤖 正在生成..."
+
+        stats = (
+            f"⏱️ 生成时间: {generation_time:.2f}秒 | 📝 生成长度: {len(response)}字符"
+            f" | ⚙️ 最大长度: {max_tokens}"
+        )
+        if max_tokens > 1024:
+            stats += " | ⏳ 提示: 较大的最大长度可能延长生成时间"
+        history_copy[-1][1] = f"🤖 {response}"
+        self.chat_history = self._clone_history(history_copy)
+        yield self._clone_history(history_copy), original_text, stats
+
+    def ocr_analysis(self, image, prompt: str = None):
+        """OCR文字识别，可选自定义提示词"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        default_prompt = (
+            "请识别并提取这张图片中的所有文字内容，尽量还原原本样式，并标注语言类型。"
+            " 请确保所有带样式或表格内容使用Markdown表格表示。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=1024,
+                temperature=0.7,
+                top_p=0.8,
+                top_k=50,
+                repetition_penalty=1.0
+            )
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            self.last_ocr_markdown = f"## OCR识别结果\n\n{response}"
+            return f"📝 OCR识别结果:\n\n{response}"
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ OCR识别失败: {str(e)}"
+
+    def spatial_analysis(self, image, prompt: str = None):
+        """空间感知分析，可选自定义提示词"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        default_prompt = (
+            "请分析这张图片中的空间关系，包括相对位置、视角、遮挡、深度与距离感，并给出整体布局描述。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=768,
+                temperature=0.7,
+                top_p=0.8,
+                top_k=50,
+                repetition_penalty=1.0
+            )
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            return f"📐 空间分析结果:\n\n{response}"
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ 空间分析失败: {str(e)}"
+
+    def visual_coding(self, image, output_format: str = "HTML", prompt: str = None):
+        """视觉编程生成代码，可选自定义提示词"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        base_prompts = {
+            "HTML": "请根据图片生成对应的HTML结构代码，包含必要的语义标签。",
+            "CSS": "请为该图片对应的界面生成合理的CSS样式代码，包括布局与颜色。",
+            "JavaScript": "请根据图片交互生成JavaScript代码示例，包含必要的事件与逻辑。",
+            "Python": "请生成能复现该界面/布局的Python示例代码（如使用streamlit或flask的伪代码）。",
+        }
+        default_prompt = base_prompts.get(output_format, base_prompts["HTML"]) + " 请只输出代码，不要额外说明。"
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=1024,
+                temperature=0.4,
+                top_p=0.8,
+                top_k=50,
+                repetition_penalty=1.0
+            )
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            return response
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ 视觉编程失败: {str(e)}"
     
     def batch_analysis(self, images, analysis_type):
         """批量分析"""
@@ -266,7 +458,101 @@ class AdvancedQwen3VLApp:
     def clear_history(self):
         """清空对话历史"""
         self.chat_history = []
+        self.chat_messages = []
+        self.last_image = None
+        self.last_saved_image_path = None
+        self.last_image_digest = None
+        self.last_ocr_markdown = None
+        if hasattr(self, "session_turn_image_paths"):
+            self.session_turn_image_paths.clear()
         return []
+
+    def export_last_ocr(self):
+        if not self.last_ocr_markdown:
+            return "❌ 没有可保存的文本样式，请先执行一次OCR识别！"
+
+        export_dir = os.path.join("ocr_exports")
+        os.makedirs(export_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sections = self._parse_markdown_sections(self.last_ocr_markdown)
+
+        word_path = os.path.join(export_dir, f"ocr_{timestamp}.docx")
+        excel_path = os.path.join(export_dir, f"ocr_{timestamp}.xlsx")
+        word_note = ""
+        excel_note = ""
+
+        # 保存 Word
+        try:
+            from docx import Document
+
+            doc = Document()
+            doc.add_heading("OCR 识别结果", level=1)
+            for section in sections:
+                if section["type"] == "text":
+                    for paragraph in section["text"].split("\n\n"):
+                        doc.add_paragraph(paragraph)
+                        doc.add_paragraph()
+                else:
+                    header = section["header"]
+                    rows = section["rows"]
+                    table = doc.add_table(rows=len(rows) + 1, cols=len(header))
+                    table.style = "Table Grid"
+                    for idx, title in enumerate(header):
+                        table.cell(0, idx).text = title
+                    for r_idx, row in enumerate(rows, start=1):
+                        for c_idx, cell in enumerate(row):
+                            table.cell(r_idx, c_idx).text = cell
+                    doc.add_paragraph()
+            if not sections:
+                doc.add_paragraph(self.last_ocr_markdown)
+            doc.save(word_path)
+        except Exception as exc:
+            word_path = os.path.join(export_dir, f"ocr_{timestamp}.md")
+            with open(word_path, "w", encoding="utf-8") as f:
+                f.write(self.last_ocr_markdown)
+            word_note = f"⚠️ Word导出失败({exc})，已保存为Markdown"
+
+        # 保存 Excel
+        try:
+            from openpyxl import Workbook
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "表格1" if sections else "OCR文本"
+
+            table_idx = 0
+            for section in sections:
+                if section["type"] == "table":
+                    table_idx += 1
+                    if table_idx > 1:
+                        ws = wb.create_sheet(title=f"表格{table_idx}")
+                    ws.append(section["header"])
+                    for row in section["rows"]:
+                        ws.append(row)
+                elif section["type"] == "text" and section["text"]:
+                    if table_idx > 0:
+                        ws = wb.create_sheet(title=f"文本{table_idx}")
+                    for line in section["text"].splitlines():
+                        ws.append([line])
+            if not sections:
+                for line in self.last_ocr_markdown.splitlines():
+                    ws.append([line])
+            wb.save(excel_path)
+        except Exception as exc:
+            excel_path = os.path.join(export_dir, f"ocr_{timestamp}.csv")
+            with open(excel_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["OCR Result"])
+                for line in self.last_ocr_markdown.splitlines():
+                    writer.writerow([line])
+            excel_note = f"⚠️ Excel导出失败({exc})，已保存为CSV"
+
+        message_lines = [
+            "✅ 文本样式已保存：",
+            f"- Word: {word_path}" + (f" ({word_note})" if word_note else ""),
+            f"- Excel: {excel_path}" + (f" ({excel_note})" if excel_note else ""),
+        ]
+        return "\n".join(message_lines)
 
 # 创建应用实例
 app = AdvancedQwen3VLApp()
@@ -278,31 +564,172 @@ def create_advanced_interface():
         title="Qwen3-VL-8B-Instruct 高级界面",
         theme=gr.themes.Soft(),
         css="""
+        :root {
+            --radius-lg: 18px;
+            --radius-md: 12px;
+            --surface: #ffffff;
+            --surface-muted: #f4f6fb;
+            --surface-border: #e2e8f0;
+            --text-primary: #0f172a;
+            --text-secondary: #64748b;
+            --accent: #2563eb;
+            --accent-soft: rgba(37, 99, 235, 0.12);
+        }
+        body {
+            background: linear-gradient(140deg, #eef2ff 0%, #f8fafc 45%, #ffffff 100%);
+            color: var(--text-primary);
+        }
         .gradio-container {
-            max-width: 1400px !important;
+            max-width: 1600px !important;
+            margin: 0 auto;
+            padding: 18px 22px 48px;
+            color: var(--text-primary);
         }
-        .chat-message {
-            padding: 10px;
-            margin: 5px 0;
-            border-radius: 10px;
+        #advanced-header {
+            background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(96, 165, 250, 0.1));
+            border: 1px solid rgba(37, 99, 235, 0.18);
+            padding: 22px 26px;
+            border-radius: 24px;
+            box-shadow: 0 16px 32px rgba(15, 23, 42, 0.08);
+            margin-bottom: 20px;
         }
-        .stats-box {
-            background-color: #f0f0f0;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 10px 0;
+        #advanced-header h1 {
+            margin: 0 0 6px;
+            font-size: 26px;
+            font-weight: 600;
+            letter-spacing: 0.2px;
+            color: var(--text-primary);
+        }
+        #advanced-header p {
+            margin: 0;
+            font-size: 15px;
+            color: var(--text-secondary);
+        }
+        .gradio-container .tabs {
+            background: transparent;
+            border: none;
+        }
+        .gradio-container .tabitem {
+            border-radius: var(--radius-md);
+            background: #f8fafc;
+            border: 1px solid transparent;
+            color: var(--text-secondary);
+        }
+        .gradio-container .tabitem.selected {
+            border-color: rgba(37, 99, 235, 0.25);
+            color: var(--text-primary);
+            background: #ffffff;
+            box-shadow: 0 8px 18px rgba(37, 99, 235, 0.08);
+        }
+        #advanced-input-panel, #advanced-chat-panel, #advanced-secondary-panel {
+            background: var(--surface);
+            border-radius: 22px;
+            padding: 20px 22px;
+            border: 1px solid var(--surface-border);
+            box-shadow: 0 20px 40px rgba(15, 23, 42, 0.06);
+        }
+        #advanced-chat-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        #advanced-chatbot > .wrap {
+            background: #f8fafc;
+            border-radius: 18px;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            padding: 8px 10px;
+        }
+        #advanced-chatbot .message {
+            border-radius: 14px !important;
+            padding: 12px 14px !important;
+            font-size: 15px;
+            line-height: 1.6;
+            color: var(--text-primary);
+        }
+        #advanced-chatbot .message.user {
+            background: linear-gradient(135deg, rgba(37, 99, 235, 0.18), rgba(59, 130, 246, 0.12));
+            border: 1px solid rgba(37, 99, 235, 0.25);
+            color: var(--text-primary);
+            align-self: flex-end;
+        }
+        #advanced-chatbot .message.bot {
+            background: #ffffff;
+            border: 1px solid rgba(203, 213, 225, 0.9);
+            color: var(--text-primary);
+            align-self: flex-start;
+        }
+        #advanced-chatbot .message.bot .markdown ul {
+            padding-left: 22px;
+        }
+        #advanced-query textarea {
+            border-radius: 14px;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            background: var(--surface);
+            color: var(--text-primary);
+            box-shadow: inset 0 1px 3px rgba(15, 23, 42, 0.05);
+        }
+        #advanced-query textarea:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+        }
+        #advanced-params .slider {
+            padding: 6px 0;
+        }
+        #advanced-params .slider input[type="range"]::-webkit-slider-thumb {
+            background: var(--accent);
+        }
+        #advanced-params .slider input[type="range"]::-moz-range-thumb {
+            background: var(--accent);
+        }
+        #advanced-stats textarea {
+            background: var(--accent-soft);
+            border: 1px solid rgba(37, 99, 235, 0.2);
+            border-radius: 14px;
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        .gradio-container .gradio-button.primary {
+            background: linear-gradient(135deg, #2563eb, #1d4ed8);
+            border: none;
+            color: #ffffff;
+            font-weight: 600;
+            box-shadow: 0 16px 28px rgba(37, 99, 235, 0.22);
+        }
+        .gradio-container .gradio-button.primary:hover {
+            filter: brightness(1.03);
+        }
+        .gradio-container .gradio-button.secondary {
+            background: rgba(37, 99, 235, 0.1);
+            border: 1px solid rgba(37, 99, 235, 0.18);
+            color: var(--text-primary);
+        }
+        .gradio-container textarea,
+        .gradio-container input[type="text"],
+        .gradio-container input[type="number"] {
+            background: var(--surface);
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            color: var(--text-primary);
+            border-radius: 14px;
+        }
+        .gradio-container textarea:focus,
+        .gradio-container input[type="text"]:focus,
+        .gradio-container input[type="number"]:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+        }
+        .gradio-container .slider > label,
+        .gradio-container .checkbox-group > label,
+        .gradio-container .radio-group > label {
+            color: var(--text-secondary);
         }
         """
     ) as interface:
         
-        gr.Markdown("""
-        # 🤖 多模态大语言模型智能分析助手
-        
-        **功能特色：**
-        - 🖼️ 智能图像理解和对话 \t 📝 多语言OCR识别
-        - 🔍 空间感知和情感分析 \t 💻 视觉编程代码生成
-        - 📊 批量图像处理 \t 🔄 图像对比分析
-        - 💾 对话历史导出 \t 📖 使用说明
+        gr.HTML("""
+        <section id="advanced-header">
+            <h1>🤖 多模态大语言模型智能分析助手</h1>
+            <p>升级后的页面布局与对话框样式，让图像问答与高级分析体验更沉浸、更高效。</p>
+        </section>
         """)
         
         with gr.Tab("🚀 模型管理"):
@@ -328,59 +755,78 @@ def create_advanced_interface():
             )
         
         with gr.Tab("💬 智能对话"):
-            gr.Markdown("### 与图像进行智能对话")
-            
-            with gr.Row():
+            with gr.Row(equal_height=True):
                 with gr.Column(scale=1):
-                    image_input = gr.Image(
-                        label="上传图像",
-                        type="pil",
-                        height=400
-                    )
-                    
-                    with gr.Accordion("🎛️ 生成参数", open=False):
-                        max_tokens = gr.Slider(
-                            minimum=50, maximum=2048, value=256,
-                            label="最大生成长度"
+                    with gr.Group(elem_id="advanced-input-panel"):
+                        gr.Markdown("### 图像与生成设置")
+                        image_input = gr.Image(
+                            label="上传图像",
+                            type="pil",
+                            height=390
                         )
-                        temperature = gr.Slider(
-                            minimum=0.1, maximum=2.0, value=0.7,
-                            label="创造性 (Temperature)"
-                        )
-                        top_p = gr.Slider(
-                            minimum=0.1, maximum=1.0, value=0.8,
-                            label="Top-p"
-                        )
-                        top_k = gr.Slider(
-                            minimum=1, maximum=100, value=20,
-                            label="Top-k"
-                        )
+                        
+                        with gr.Accordion("🎛️ 生成参数", open=False, elem_id="advanced-params"):
+                            max_tokens = gr.Slider(
+                                minimum=50, maximum=2048, value=256,
+                                label="最大生成长度"
+                            )
+                            temperature = gr.Slider(
+                                minimum=0.1, maximum=2.0, value=0.7,
+                                label="创造性 (Temperature)"
+                            )
+                            top_p = gr.Slider(
+                                minimum=0.1, maximum=1.0, value=0.8,
+                                label="Top-p"
+                            )
+                            top_k = gr.Slider(
+                                minimum=1, maximum=100, value=20,
+                                label="Top-k"
+                            )
                 
                 with gr.Column(scale=2):
-                    chatbot = gr.Chatbot(
-                        label="对话历史",
-                        height=400,
-                        show_label=True
-                    )
-                    
-                    with gr.Row():
-                        text_input = gr.Textbox(
-                            label="输入问题",
-                            placeholder="请描述这张图片...",
-                            lines=2
+                    with gr.Group(elem_id="advanced-chat-panel"):
+                        gr.Markdown("### 对话与输出")
+                        chatbot = gr.Chatbot(
+                            label=None,
+                            height=420,
+                            show_label=False,
+                            type="tuples",
+                            elem_id="advanced-chatbot"
                         )
-                        send_btn = gr.Button("发送", variant="primary")
-                    
-                    with gr.Row():
-                        clear_btn = gr.Button("🗑️ 清空历史")
-                        export_btn = gr.Button("💾 导出历史")
-                    
-                    stats_output = gr.Textbox(
-                        label="生成统计",
-                        interactive=False
-                    )
+                        
+                        with gr.Row():
+                            text_input = gr.Textbox(
+                                label=None,
+                                placeholder="输入想了解的内容，按 Enter 或点击发送。",
+                                lines=2,
+                                elem_id="advanced-query"
+                            )
+                            send_btn = gr.Button("发送", variant="primary")
+                        
+                        with gr.Row():
+                            clear_btn = gr.Button("🗑️ 清空历史", variant="secondary")
+                            export_btn = gr.Button("💾 导出历史", variant="secondary")
+
+                        save_style_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
+                        ocr_export_status = gr.Textbox(
+                            label="保存状态",
+                            interactive=False,
+                            lines=2,
+                        )
+                        
+                        stats_output = gr.Textbox(
+                            label=None,
+                            placeholder="生成速度与长度等统计会显示在这里。",
+                            interactive=False,
+                            elem_id="advanced-stats"
+                        )
             
             # 事件绑定
+            def _run_ocr(image):
+                result = app.ocr_analysis(image)
+                has_result = not result.startswith("❌")
+                return result, gr.update(interactive=has_result), ""
+
             send_btn.click(
                 app.chat_with_image,
                 inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k],
@@ -394,13 +840,24 @@ def create_advanced_interface():
             )
             
             clear_btn.click(
-                app.clear_history,
-                outputs=[chatbot]
+                lambda: (app.clear_history(), gr.update(interactive=False), ""),
+                outputs=[chatbot, save_style_btn, ocr_export_status]
             )
             
             export_btn.click(
                 app.export_chat_history,
                 outputs=[stats_output]
+            )
+
+            ocr_btn.click(
+                _run_ocr,
+                inputs=[ocr_image],
+                outputs=[ocr_result, save_style_btn, ocr_export_status]
+            )
+
+            save_style_btn.click(
+                app.export_last_ocr,
+                outputs=[ocr_export_status]
             )
         
         with gr.Tab("📊 批量分析"):
@@ -521,6 +978,8 @@ def main():
     # 创建界面
     interface = create_advanced_interface()
     
+    interface.queue()
+
     # 启动服务
     interface.launch(
         server_name="0.0.0.0",
