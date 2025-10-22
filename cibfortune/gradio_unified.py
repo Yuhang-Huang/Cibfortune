@@ -151,35 +151,89 @@ def handle_unified_chat(image,
     try:
         if mode == "通用版":
             effective_prompt = user_text
-        else:
-            task = pro_task or "任务问答"
-            effective_prompt = user_text if user_text else _get_default_prompt(task, code_format)
-        chat_result = app.chat_with_image(
-            image,
-            effective_prompt,
-            history,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            repetition_penalty,
-            presence_penalty
-        )
+            chat_result = app.chat_with_image(
+                image,
+                effective_prompt,
+                history,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                presence_penalty
+            )
 
-        if inspect.isgenerator(chat_result):
-            for out_history, cleared, stats in chat_result:
+            if inspect.isgenerator(chat_result):
+                for out_history, cleared, stats in chat_result:
+                    if not image_recorded and len(out_history) > prev_turns:
+                        record_image_path()
+                    app.chat_history = out_history
+                    button_update = gr.update(interactive=bool(app.last_ocr_markdown))
+                    stats_update = gr.update(value=stats, visible=True)
+                    yield out_history, cleared, stats_update, button_update, gr.update(value="", visible=True)
+            else:
+                out_history, cleared, stats = chat_result
                 if not image_recorded and len(out_history) > prev_turns:
                     record_image_path()
                 app.chat_history = out_history
                 button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-                yield out_history, cleared, stats, button_update
+                stats_update = gr.update(value=stats, visible=True)
+                yield out_history, cleared, stats_update, button_update, gr.update(value="", visible=True)
+
         else:
-            out_history, cleared, stats = chat_result
-            if not image_recorded and len(out_history) > prev_turns:
-                record_image_path()
-            app.chat_history = out_history
-            button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-            yield out_history, cleared, stats, button_update
+            task = pro_task or "任务问答"
+            if task == "OCR识别":
+                if image is None:
+                    stats_update = gr.update(value="❌ 请上传图像！", visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), "❌ 请上传图像！"
+                    return
+
+                result = app.ocr_analysis(image)
+
+                if result.startswith("❌"):
+                    stats_update = gr.update(value="", visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), result
+                    return
+
+                prompt_text = user_text if user_text else _get_default_prompt(task, code_format)
+                updated_history = history + [[f"👤 {prompt_text}", result]]
+                app.chat_history = updated_history
+                if not image_recorded:
+                    record_image_path()
+                stats_update = gr.update(value=app.last_ocr_markdown, visible=True)
+                status_update = "✅ OCR识别完成，可导出样式"
+                yield updated_history, "", stats_update, gr.update(interactive=bool(app.last_ocr_markdown)), status_update
+                return
+
+            effective_prompt = user_text if user_text else _get_default_prompt(task, code_format)
+            chat_result = app.chat_with_image(
+                image,
+                effective_prompt,
+                history,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                presence_penalty
+            )
+
+            if inspect.isgenerator(chat_result):
+                for out_history, cleared, stats in chat_result:
+                    if not image_recorded and len(out_history) > prev_turns:
+                        record_image_path()
+                    app.chat_history = out_history
+                    button_update = gr.update(interactive=bool(app.last_ocr_markdown))
+                    stats_update = gr.update(value=stats, visible=True)
+                    yield out_history, cleared, stats_update, button_update, gr.update()
+            else:
+                out_history, cleared, stats = chat_result
+                if not image_recorded and len(out_history) > prev_turns:
+                    record_image_path()
+                app.chat_history = out_history
+                button_update = gr.update(interactive=bool(app.last_ocr_markdown))
+                stats_update = gr.update(value=stats, visible=True)
+                yield out_history, cleared, stats_update, button_update, gr.update()
 
         if not image_recorded and len(app.chat_history) > prev_turns:
             record_image_path()
@@ -190,7 +244,8 @@ def handle_unified_chat(image,
         if not image_recorded and len(history) > prev_turns:
             record_image_path()
         button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-        yield history, text, f"❌ 错误: {str(e)}", button_update
+        stats_update = gr.update(value=f"❌ 错误: {str(e)}", visible=True)
+        yield history, text, stats_update, button_update, f"❌ 错误: {str(e)}"
 
 
 def save_chat_to_folder(save_dir, history):
@@ -443,6 +498,42 @@ def create_unified_interface():
         border-color: var(--accent);
         box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
     }
+    /*
+    Bigger markdown preview area for unified stats (OCR/table preview)
+    */
+    #unified-stats {
+        max-height: 560px;
+        overflow: auto;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        padding: 12px 14px;
+        border-radius: 14px;
+        background: #ffffff;
+    }
+    #unified-stats table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 8px 0 14px;
+    }
+    #unified-stats th,
+    #unified-stats td {
+        border: 1px solid #e5e7eb;
+        padding: 8px 10px;
+        text-align: left;
+        vertical-align: top;
+        font-size: 14px;
+        line-height: 1.55;
+    }
+    #unified-stats thead th {
+        background: #f8fafc;
+        font-weight: 600;
+    }
+    #unified-stats code {
+        background: #f8fafc;
+        border: 1px solid #e5e7eb;
+        padding: 1px 4px;
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
     """
 
     with gr.Blocks(
@@ -478,15 +569,8 @@ def create_unified_interface():
                     lines=3,
                 )
             with gr.Column(scale=1, min_width=240):
-                save_dir = gr.Textbox(value="chat_history", label="保存目录", interactive=False)
                 save_btn = gr.Button("💾 保存当前对话", variant="secondary")
-            with gr.Column(scale=1, min_width=240):
-                ocr_export_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
-                ocr_export_status = gr.Textbox(
-                    label="保存状态",
-                    interactive=False,
-                    lines=2
-                )
+                save_dir = gr.Textbox(value="chat_history", label="保存目录", interactive=False)
 
         load_btn.click(app.load_model, outputs=[status_text, load_btn])
 
@@ -528,29 +612,35 @@ def create_unified_interface():
                         gr.Markdown("### 对话与输出")
                         chatbot = gr.Chatbot(
                             label=None,
-                            height=420,
+                            height=500,
                             show_label=False,
                             type="tuples",
-                            elem_id="unified-chatbot"
+                            elem_id="unified-chatbot",
+                            render_markdown=True
                         )
-                        with gr.Row():
-                            text_input = gr.Textbox(
-                                label=None,
-                                placeholder="输入想了解的内容，按 Enter 或点击发送。",
-                                lines=2,
-                                elem_id="unified-query"
-                            )
-                            send_btn = gr.Button("发送", variant="primary")
-
-                        with gr.Row():
-                            clear_btn = gr.Button("🗑️ 清空历史", variant="secondary")
-                        stats_output = gr.Textbox(
+                        text_input = gr.Textbox(
                             label=None,
-                            placeholder="生成速度与长度统计会显示在这里。",
-                            interactive=False,
-                            visible=False,
-                            elem_id="unified-stats"
+                            placeholder="输入想了解的内容，按 Enter 或点击发送。",
+                            lines=3,
+                            elem_id="unified-query"
                         )
+                        with gr.Row():
+                            send_btn = gr.Button("发送", variant="primary", scale=1)
+                            clear_btn = gr.Button("🗑️ 清空历史", variant="secondary", scale=1)
+                        with gr.Row():
+                            with gr.Column(scale=4):
+                                stats_output = gr.Markdown(
+                                    value="",
+                                    visible=False,
+                                    elem_id="unified-stats"
+                                )
+                            with gr.Column(scale=1, min_width=220):
+                                ocr_export_btn = gr.Button("💾 导出样式", variant="secondary", interactive=False)
+                                ocr_export_status = gr.Textbox(
+                                    label="导出状态",
+                                    interactive=False,
+                                    lines=4
+                                )
                 code_format = gr.Dropdown(
                     choices=["HTML", "CSS", "JavaScript", "Python"],
                     value="HTML",
@@ -562,14 +652,21 @@ def create_unified_interface():
             send_btn.click(
                 handle_unified_chat,
                 inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k, mode, pro_task, code_format, repetition_penalty, presence_penalty],
-                outputs=[chatbot, text_input, stats_output, ocr_export_btn],
+                outputs=[chatbot, text_input, stats_output, ocr_export_btn, ocr_export_status],
             )
             text_input.submit(
                 handle_unified_chat,
                 inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k, mode, pro_task, code_format, repetition_penalty, presence_penalty],
-                outputs=[chatbot, text_input, stats_output, ocr_export_btn],
+                outputs=[chatbot, text_input, stats_output, ocr_export_btn, ocr_export_status],
             )
-            clear_btn.click(app.clear_history, outputs=[chatbot])
+            def _clear_session():
+                app.clear_history()
+                return [], "", gr.update(value="", visible=False), gr.update(interactive=False), ""
+
+            clear_btn.click(
+                _clear_session,
+                outputs=[chatbot, text_input, stats_output, ocr_export_btn, ocr_export_status],
+            )
         save_btn.click(save_chat_to_folder, inputs=[save_dir, chatbot], outputs=[status_text])
 
         ocr_export_btn.click(
@@ -590,7 +687,7 @@ def create_unified_interface():
                         )
                         batch_btn = gr.Button("🔍 开始批量分析", variant="primary")
                     with gr.Column():
-                        batch_result = gr.Textbox(label="批量分析结果", lines=20, max_lines=30)
+                        batch_result = gr.Markdown()
             batch_btn.click(app.batch_analysis, inputs=[batch_images, analysis_type], outputs=[batch_result])
 
         with gr.Tab("🔄 图像对比", visible=False) as tab_compare:
@@ -604,7 +701,7 @@ def create_unified_interface():
                         )
                         compare_btn = gr.Button("🔄 开始对比", variant="primary")
                     with gr.Column():
-                        compare_result = gr.Textbox(label="对比结果", lines=20, max_lines=25)
+                        compare_result = gr.Markdown()
             compare_btn.click(
                 app.compare_images,
                 inputs=[compare_image1, compare_image2, comparison_type],

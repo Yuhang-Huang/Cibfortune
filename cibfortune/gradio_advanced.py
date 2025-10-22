@@ -137,25 +137,67 @@ class AdvancedQwen3VLApp:
             return []
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
-    @staticmethod
-    def _parse_markdown_sections(markdown_text):
+    def _parse_markdown_sections(self, markdown_text):
+        """
+        将 Markdown 文本拆分为 table/text 段，支持：
+        - 管道表格（| a | b |）
+        - HTML <table>（若存在）
+        并在解析前对围栏代码块进行去围栏清洗，确保导出与渲染一致。
+        """
         sections = []
-        lines = markdown_text.splitlines()
+        if not markdown_text:
+            return sections
+        
+        # 1) 先去掉围栏，使得“代码块中的表格”也能被识别为可导出的内容
+        cleaned_md = self._sanitize_markdown(markdown_text)
+        
+        # 2) 先尝试解析 HTML 表格（若模型输出了 <table>）
+        html_tables = []
+        try:
+            from bs4 import BeautifulSoup  # 可选依赖
+            soup = BeautifulSoup(cleaned_md, "html.parser")
+            for t in soup.find_all("table"):
+                headers = []
+                header_row = t.find("tr")
+                if header_row:
+                    # 如果有 <th> 用 th；否则用首行的 td 作为 header
+                    ths = header_row.find_all("th")
+                    if ths:
+                        headers = [th.get_text(strip=True) for th in ths]
+                        data_rows = header_row.find_next_siblings("tr")
+                    else:
+                        tds = header_row.find_all("td")
+                        headers = [td.get_text(strip=True) for td in tds]
+                        data_rows = header_row.find_next_siblings("tr")
+                rows = []
+                for r in (data_rows or []):
+                    cols = r.find_all(["td", "th"])
+                    rows.append([c.get_text(strip=True) for c in cols])
+                if headers or rows:
+                    html_tables.append({"type": "table", "header": headers, "rows": rows})
+        except Exception:
+            # 如果 bs4 不在环境中，则略过 HTML 解析
+            pass
+        
+        # 3) 解析管道表格
+        lines = cleaned_md.splitlines()
         i = 0
-
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
+            
+            # 管道表格判定：当前行和下一行构成 header + 分隔
             is_table = (
                 stripped.startswith("|")
                 and stripped.count("|") >= 2
                 and i + 1 < len(lines)
                 and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
+                and lines[i + 1].strip().startswith("|")
             )
-
+            
             if is_table:
                 header = [cell.strip() for cell in stripped.strip("|").split("|")]
-                i += 2  # skip header and separator
+                i += 2  # 跳过 header 与分隔线
                 rows = []
                 while i < len(lines):
                     row_line = lines[i].strip()
@@ -166,7 +208,8 @@ class AdvancedQwen3VLApp:
                     i += 1
                 sections.append({"type": "table", "header": header, "rows": rows})
                 continue
-
+            
+            # 普通文本块（直到遇到下一个表格或文件结束）
             text_block = []
             while i < len(lines):
                 current = lines[i]
@@ -176,17 +219,25 @@ class AdvancedQwen3VLApp:
                     and stripped_current.count("|") >= 2
                     and i + 1 < len(lines)
                     and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
+                    and lines[i + 1].strip().startswith("|")
                 )
                 if next_is_table:
                     break
                 text_block.append(current)
                 i += 1
+                # 保留空行，改善段落分隔的可读性
                 if i < len(lines) and lines[i] == "":
                     text_block.append(lines[i])
+            
             text_content = "\n".join(text_block).strip("\n")
             if text_content:
                 sections.append({"type": "text", "text": text_content})
-
+        
+        # 4) 若存在 HTML 表，优先把 HTML 表也加入（放在解析结果前面，避免遗漏）
+        if html_tables:
+            # 将 HTML 表插在最前面（也可根据需要合并/去重）
+            sections = html_tables + sections
+        
         return sections
 
     def chat_with_image(self, image, text, history, max_tokens, temperature, top_p, top_k, repetition_penalty: float = 1.0, presence_penalty: float = 1.5):
@@ -244,6 +295,23 @@ class AdvancedQwen3VLApp:
         self.chat_history = self._clone_history(history_copy)
         yield self._clone_history(history_copy), original_text, stats
 
+    def _sanitize_markdown(self, text: str) -> str:
+        if not text:
+            return ""
+        s = text.strip()
+        lines = s.splitlines()
+        out = []
+        in_fence = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence:
+                out.append(line)
+        cleaned = "\n".join(out).strip()
+        return cleaned if cleaned else s
+
     def ocr_analysis(self, image, prompt: str = None):
         """OCR文字识别，可选自定义提示词"""
         if not self.is_loaded:
@@ -263,9 +331,10 @@ class AdvancedQwen3VLApp:
                 top_k=50,
                 repetition_penalty=1.0
             )
-            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
-            self.last_ocr_markdown = f"## OCR识别结果\n\n{response}"
-            return f"📝 OCR识别结果:\n\n{response}"
+            cleaned = self._sanitize_markdown(response)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
+            self.last_ocr_markdown = f"## OCR识别结果\n\n{cleaned}"
+            return f"📝 OCR识别结果:\n\n{cleaned}"
         except ValueError as exc:
             return str(exc)
         except Exception as e:
@@ -694,6 +763,14 @@ def create_advanced_interface():
         .gradio-container .radio-group > label {
             color: var(--text-secondary);
         }
+        #ocr-md {
+            max-height: 560px;
+            overflow: auto;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            padding: 12px;
+            border-radius: 14px;
+            background: #ffffff;
+        }
         """
     ) as interface:
         
@@ -736,7 +813,7 @@ def create_advanced_interface():
                             type="pil",
                             height=390
                         )
-                        
+
                         with gr.Accordion("🎛️ 生成参数", open=False, elem_id="advanced-params"):
                             max_tokens = gr.Slider(
                                 minimum=50, maximum=2048, value=256,
@@ -754,16 +831,17 @@ def create_advanced_interface():
                                 minimum=1, maximum=100, value=20,
                                 label="Top-k"
                             )
-                
+
                 with gr.Column(scale=2):
                     with gr.Group(elem_id="advanced-chat-panel"):
                         gr.Markdown("### 对话与输出")
                         chatbot = gr.Chatbot(
                             label=None,
-                            height=560,
+                            height=600,
                             show_label=False,
                             type="tuples",
-                            elem_id="advanced-chatbot"
+                            elem_id="advanced-chatbot",
+                            render_markdown=True
                         )
                         text_input = gr.Textbox(
                             label=None,
@@ -773,68 +851,86 @@ def create_advanced_interface():
                         )
                         send_btn = gr.Button("发送", variant="primary")
 
-                        stats_output = gr.Textbox(
-                            label=None,
-                            placeholder="生成速度与长度等统计会显示在这里。",
-                            interactive=False,
+                        stats_output = gr.Markdown(
+                            value="",
                             elem_id="advanced-stats"
                         )
 
                         with gr.Row():
-                            save_style_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
                             clear_btn = gr.Button("🗑️ 清空历史", variant="secondary")
                             export_btn = gr.Button("📁 导出对话", variant="secondary")
 
-                        ocr_export_status = gr.Textbox(
-                            label="保存状态",
-                            interactive=False,
-                            lines=2,
-                        )
-            
-            # 事件绑定
-            def _run_ocr(image):
-                result = app.ocr_analysis(image)
-                has_result = not result.startswith("❌")
-                status = "" if has_result else result
-                return result, gr.update(interactive=has_result), status
+        with gr.Tab("📝 OCR识别"):
+            gr.Markdown("### 文字识别")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    ocr_image = gr.Image(
+                        label="上传图像进行OCR识别",
+                        type="pil",
+                        height=320
+                    )
+                    ocr_btn = gr.Button("🔍 开始识别", variant="primary")
+                with gr.Column(scale=1):
+                    with gr.Row():
+                        with gr.Column(scale=4):
+                            ocr_md = gr.Markdown(
+                                value="（识别结果会以 Markdown 渲染，包括表格）",
+                                elem_id="ocr-md"
+                            )
+                        with gr.Column(scale=1):
+                            save_style_btn = gr.Button("💾 导出样式", variant="secondary", interactive=False)
+                            ocr_export_status = gr.Textbox(
+                                label="导出状态",
+                                interactive=False,
+                                lines=4
+                            )
 
-            send_btn.click(
-                app.chat_with_image,
-                inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k],
-                outputs=[chatbot, text_input, stats_output]
-            )
-            
-            text_input.submit(
-                app.chat_with_image,
-                inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k],
-                outputs=[chatbot, text_input, stats_output]
-            )
-            
-            def _clear_all():
-                app.clear_history()
-                return [], gr.update(interactive=False), "", ""
+        # 事件绑定
+        def _run_ocr(image):
+            result = app.ocr_analysis(image)
+            can_save = bool(app.last_ocr_markdown)
+            # 对显示内容：如果成功，展示渲染后的 Markdown；如果失败，将错误提示放到右侧状态框
+            display_md = app.last_ocr_markdown if can_save else ""
+            status = "" if can_save else result
+            return display_md, gr.update(interactive=can_save), status
 
-            clear_btn.click(
-                _clear_all,
-                outputs=[chatbot, save_style_btn, stats_output, ocr_export_status]
-            )
-            
-            export_btn.click(
-                app.export_chat_history,
-                outputs=[stats_output]
-            )
+        def _clear_all():
+            app.clear_history()
+            return [], "", "", gr.update(interactive=False), ""
 
-            ocr_btn.click(
-                _run_ocr,
-                inputs=[ocr_image],
-                outputs=[ocr_result, save_style_btn, ocr_export_status]
-            )
+        send_btn.click(
+            app.chat_with_image,
+            inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k],
+            outputs=[chatbot, text_input, stats_output]
+        )
 
-            save_style_btn.click(
-                app.export_last_ocr,
-                outputs=[ocr_export_status]
-            )
-        
+        text_input.submit(
+            app.chat_with_image,
+            inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k],
+            outputs=[chatbot, text_input, stats_output]
+        )
+
+        clear_btn.click(
+            _clear_all,
+            outputs=[chatbot, text_input, stats_output, save_style_btn, ocr_export_status]
+        )
+
+        export_btn.click(
+            app.export_chat_history,
+            outputs=[stats_output]
+        )
+
+        ocr_btn.click(
+            _run_ocr,
+            inputs=[ocr_image],
+            outputs=[ocr_md, save_style_btn, ocr_export_status]
+        )
+
+        save_style_btn.click(
+            app.export_last_ocr,
+            outputs=[ocr_export_status]
+        )
+
         with gr.Tab("📊 批量分析"):
             gr.Markdown("### 批量图像分析")
             
@@ -855,11 +951,7 @@ def create_advanced_interface():
                     batch_btn = gr.Button("🔍 开始批量分析", variant="primary")
                 
                 with gr.Column():
-                    batch_result = gr.Textbox(
-                        label="批量分析结果",
-                        lines=20,
-                        max_lines=30
-                    )
+                    batch_result = gr.Markdown()
             
             batch_btn.click(
                 app.batch_analysis,
@@ -892,11 +984,7 @@ def create_advanced_interface():
                     compare_btn = gr.Button("🔄 开始对比", variant="primary")
                 
                 with gr.Column():
-                    compare_result = gr.Textbox(
-                        label="对比结果",
-                        lines=20,
-                        max_lines=25
-                    )
+                    compare_result = gr.Markdown()
             
             compare_btn.click(
                 app.compare_images,

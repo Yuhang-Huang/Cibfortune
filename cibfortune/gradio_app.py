@@ -32,6 +32,22 @@ class Qwen3VLGradioApp:
         self.chat_messages = []
         self.last_image = None
         self.last_ocr_markdown = None
+
+    def _sanitize_markdown(self, text: str) -> str:
+        if not text:
+            return ""
+        s = text.strip()
+        lines = s.splitlines()
+        out = []
+        in_fence = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            out.append(line) if not in_fence else None
+        cleaned = "\n".join(out).strip()
+        return cleaned if cleaned else s
         
     def load_model(self, progress=gr.Progress()):
         """加载模型"""
@@ -224,9 +240,10 @@ class Qwen3VLGradioApp:
         
         try:
             prompt_clean, response, _ = self._run_inference(image, effective_prompt, max_tokens=1024, temperature=0.7)
-            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
-            self.last_ocr_markdown = f"## OCR识别结果\n\n{response}"
-            return f"📝 OCR识别结果:\n\n{response}"
+            cleaned = self._sanitize_markdown(response)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
+            self.last_ocr_markdown = f"## OCR识别结果\n\n{cleaned}"
+            return f"📝 OCR识别结果:\n\n{cleaned}"
         except ValueError as exc:
             return str(exc)
         except Exception as e:
@@ -364,6 +381,14 @@ def create_interface():
             margin: 5px 0;
             border-radius: 10px;
         }
+        #ocr-md {
+            max-height: 560px;
+            overflow: auto;
+            border: 1px solid #eee;
+            padding: 10px;
+            border-radius: 6px;
+            background: #fff;
+        }
         """
     ) as interface:
         
@@ -419,7 +444,8 @@ def create_interface():
                     chatbot = gr.Chatbot(
                         label="对话历史",
                         height=400,
-                        show_label=True
+                        show_label=True,
+                        render_markdown=True
                     )
                     
                     with gr.Row():
@@ -459,28 +485,29 @@ def create_interface():
                     )
                     ocr_btn = gr.Button("🔍 开始识别", variant="primary")
                 
-                with gr.Column():
-                    ocr_result = gr.Textbox(
-                        label="识别结果",
-                        lines=15,
-                        max_lines=20
+                with gr.Column(scale=2):
+                    ocr_md = gr.Markdown(
+                        value="",
+                        elem_id="ocr-md"
                     )
-                    save_style_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
+                    save_style_btn = gr.Button("💾 导出样式", variant="secondary", interactive=False)
                     ocr_export_status = gr.Textbox(
-                        label="保存状态",
+                        label="导出状态",
                         interactive=False,
-                        lines=2
+                        lines=4
                     )
 
             def _run_ocr(image):
                 result = app.ocr_analysis(image)
-                has_result = not result.startswith("❌")
-                return result, gr.update(interactive=has_result), ""
+                can_save = bool(app.last_ocr_markdown) and not result.startswith("❌")
+                display_md = app.last_ocr_markdown if can_save else ""
+                status = "" if can_save else result
+                return display_md, gr.update(interactive=can_save), status
 
             ocr_btn.click(
                 _run_ocr,
                 inputs=[ocr_image],
-                outputs=[ocr_result, save_style_btn, ocr_export_status]
+                outputs=[ocr_md, save_style_btn, ocr_export_status]
             )
 
             save_style_btn.click(
