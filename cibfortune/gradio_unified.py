@@ -481,11 +481,6 @@ def create_unified_interface():
                 save_dir = gr.Textbox(value="chat_history", label="保存目录", interactive=False)
                 save_btn = gr.Button("💾 保存当前对话", variant="secondary")
             with gr.Column(scale=1, min_width=240):
-                ocr_export_format = gr.Dropdown(
-                    choices=["Markdown", "Excel"],
-                    value="Markdown",
-                    label="OCR导出格式"
-                )
                 ocr_export_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
                 ocr_export_status = gr.Textbox(
                     label="保存状态",
@@ -579,7 +574,6 @@ def create_unified_interface():
 
         ocr_export_btn.click(
             app.export_last_ocr,
-            inputs=[ocr_export_format],
             outputs=[ocr_export_status],
         )
 

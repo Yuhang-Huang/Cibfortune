@@ -476,50 +476,14 @@ class AdvancedQwen3VLApp:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         sections = self._parse_markdown_sections(self.last_ocr_markdown)
 
-        word_path = os.path.join(export_dir, f"ocr_{timestamp}.docx")
         excel_path = os.path.join(export_dir, f"ocr_{timestamp}.xlsx")
-        word_note = ""
         excel_note = ""
-
-        # 保存 Word
-        try:
-            from docx import Document
-
-            doc = Document()
-            doc.add_heading("OCR 识别结果", level=1)
-            for section in sections:
-                if section["type"] == "text":
-                    for paragraph in section["text"].split("\n\n"):
-                        doc.add_paragraph(paragraph)
-                        doc.add_paragraph()
-                else:
-                    header = section["header"]
-                    rows = section["rows"]
-                    table = doc.add_table(rows=len(rows) + 1, cols=len(header))
-                    table.style = "Table Grid"
-                    for idx, title in enumerate(header):
-                        table.cell(0, idx).text = title
-                    for r_idx, row in enumerate(rows, start=1):
-                        for c_idx, cell in enumerate(row):
-                            table.cell(r_idx, c_idx).text = cell
-                    doc.add_paragraph()
-            if not sections:
-                doc.add_paragraph(self.last_ocr_markdown)
-            doc.save(word_path)
-        except Exception as exc:
-            word_path = os.path.join(export_dir, f"ocr_{timestamp}.md")
-            with open(word_path, "w", encoding="utf-8") as f:
-                f.write(self.last_ocr_markdown)
-            word_note = f"⚠️ Word导出失败({exc})，已保存为Markdown"
-
-        # 保存 Excel
         try:
             from openpyxl import Workbook
 
             wb = Workbook()
             ws = wb.active
             ws.title = "表格1" if sections else "OCR文本"
-
             table_idx = 0
             for section in sections:
                 if section["type"] == "table":
@@ -547,10 +511,18 @@ class AdvancedQwen3VLApp:
                     writer.writerow([line])
             excel_note = f"⚠️ Excel导出失败({exc})，已保存为CSV"
 
+        json_path = os.path.join(export_dir, f"ocr_{timestamp}.json")
+        json_content = {
+            "markdown": self.last_ocr_markdown,
+            "sections": sections,
+        }
+        with open(json_path, "w", encoding='utf-8') as f:
+            json.dump(json_content, f, ensure_ascii=False, indent=2)
+
         message_lines = [
             "✅ 文本样式已保存：",
-            f"- Word: {word_path}" + (f" ({word_note})" if word_note else ""),
             f"- Excel: {excel_path}" + (f" ({excel_note})" if excel_note else ""),
+            f"- JSON: {json_path}",
         ]
         return "\n".join(message_lines)
 
@@ -788,44 +760,43 @@ def create_advanced_interface():
                         gr.Markdown("### 对话与输出")
                         chatbot = gr.Chatbot(
                             label=None,
-                            height=420,
+                            height=560,
                             show_label=False,
                             type="tuples",
                             elem_id="advanced-chatbot"
                         )
-                        
-                        with gr.Row():
-                            text_input = gr.Textbox(
-                                label=None,
-                                placeholder="输入想了解的内容，按 Enter 或点击发送。",
-                                lines=2,
-                                elem_id="advanced-query"
-                            )
-                            send_btn = gr.Button("发送", variant="primary")
-                        
-                        with gr.Row():
-                            clear_btn = gr.Button("🗑️ 清空历史", variant="secondary")
-                            export_btn = gr.Button("💾 导出历史", variant="secondary")
-
-                        save_style_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
-                        ocr_export_status = gr.Textbox(
-                            label="保存状态",
-                            interactive=False,
-                            lines=2,
+                        text_input = gr.Textbox(
+                            label=None,
+                            placeholder="输入想了解的内容，按 Enter 或点击发送。",
+                            lines=3,
+                            elem_id="advanced-query"
                         )
-                        
+                        send_btn = gr.Button("发送", variant="primary")
+
                         stats_output = gr.Textbox(
                             label=None,
                             placeholder="生成速度与长度等统计会显示在这里。",
                             interactive=False,
                             elem_id="advanced-stats"
                         )
+
+                        with gr.Row():
+                            save_style_btn = gr.Button("💾 保存文本样式", variant="secondary", interactive=False)
+                            clear_btn = gr.Button("🗑️ 清空历史", variant="secondary")
+                            export_btn = gr.Button("📁 导出对话", variant="secondary")
+
+                        ocr_export_status = gr.Textbox(
+                            label="保存状态",
+                            interactive=False,
+                            lines=2,
+                        )
             
             # 事件绑定
             def _run_ocr(image):
                 result = app.ocr_analysis(image)
                 has_result = not result.startswith("❌")
-                return result, gr.update(interactive=has_result), ""
+                status = "" if has_result else result
+                return result, gr.update(interactive=has_result), status
 
             send_btn.click(
                 app.chat_with_image,
@@ -839,9 +810,13 @@ def create_advanced_interface():
                 outputs=[chatbot, text_input, stats_output]
             )
             
+            def _clear_all():
+                app.clear_history()
+                return [], gr.update(interactive=False), "", ""
+
             clear_btn.click(
-                lambda: (app.clear_history(), gr.update(interactive=False), ""),
-                outputs=[chatbot, save_style_btn, ocr_export_status]
+                _clear_all,
+                outputs=[chatbot, save_style_btn, stats_output, ocr_export_status]
             )
             
             export_btn.click(

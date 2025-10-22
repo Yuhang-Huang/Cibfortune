@@ -295,41 +295,8 @@ class Qwen3VLGradioApp:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         sections = self._parse_markdown_sections(self.last_ocr_markdown)
 
-        word_path = os.path.join(export_dir, f"ocr_{timestamp}.docx")
         excel_path = os.path.join(export_dir, f"ocr_{timestamp}.xlsx")
-        word_note = ""
         excel_note = ""
-
-        try:
-            from docx import Document
-
-            doc = Document()
-            doc.add_heading("OCR 识别结果", level=1)
-            for section in sections:
-                if section["type"] == "text":
-                    for paragraph in section["text"].split("\n\n"):
-                        doc.add_paragraph(paragraph)
-                        doc.add_paragraph()
-                else:
-                    header = section["header"]
-                    rows = section["rows"]
-                    table = doc.add_table(rows=len(rows) + 1, cols=len(header))
-                    table.style = "Table Grid"
-                    for idx, title in enumerate(header):
-                        table.cell(0, idx).text = title
-                    for r_idx, row in enumerate(rows, start=1):
-                        for c_idx, cell in enumerate(row):
-                            table.cell(r_idx, c_idx).text = cell
-                    doc.add_paragraph()
-            if not sections:
-                doc.add_paragraph(self.last_ocr_markdown)
-            doc.save(word_path)
-        except Exception as exc:
-            word_path = os.path.join(export_dir, f"ocr_{timestamp}.md")
-            with open(word_path, "w", encoding="utf-8") as f:
-                f.write(self.last_ocr_markdown)
-            word_note = f"⚠️ Word导出失败({exc})，已保存为Markdown"
-
         try:
             from openpyxl import Workbook
 
@@ -363,13 +330,22 @@ class Qwen3VLGradioApp:
                     writer.writerow([line])
             excel_note = f"⚠️ Excel导出失败({exc})，已保存为CSV"
 
+        json_path = os.path.join(export_dir, f"ocr_{timestamp}.json")
+        json_content = {
+            "markdown": self.last_ocr_markdown,
+            "sections": sections,
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(json_content, f, ensure_ascii=False, indent=2)
+
         message_lines = [
             "✅ 文本样式已保存：",
-            f"- Word: {word_path}" + (f" ({word_note})" if word_note else ""),
             f"- Excel: {excel_path}" + (f" ({excel_note})" if excel_note else ""),
+            f"- JSON: {json_path}",
         ]
         return "\n".join(message_lines)
 
+# 创建应用实例
 # 创建应用实例
 app = Qwen3VLGradioApp()
 
