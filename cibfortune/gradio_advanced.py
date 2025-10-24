@@ -245,19 +245,19 @@ class AdvancedQwen3VLApp:
         original_text = text
 
         if not self.is_loaded:
-            yield history, original_text, "❌ 请先加载模型！"
+            yield history, original_text, gr.update(value="❌ 请先加载模型！", visible=True)
             return
 
         try:
             prepared = self._prepare_user_message(image, text)
         except ValueError as exc:
-            yield history, original_text, str(exc)
+            yield history, original_text, gr.update(value=str(exc), visible=True)
             return
 
         prompt_clean, _ = prepared
         history_copy = self._clone_history(history)
         history_copy.append([f"👤 {prompt_clean}", "🤖 正在思考..."])
-        yield self._clone_history(history_copy), original_text, "🤖 正在思考..."
+        yield self._clone_history(history_copy), original_text, gr.update(value="🤖 正在思考...", visible=True)
 
         try:
             _, response, generation_time = self._run_inference(
@@ -273,7 +273,7 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             history_copy[-1][1] = f"❌ 生成失败: {str(e)}"
             self.chat_history = self._clone_history(history_copy)
-            yield self._clone_history(history_copy), original_text, f"❌ 错误: {str(e)}"
+            yield self._clone_history(history_copy), original_text, gr.update(value=f"❌ 错误: {str(e)}", visible=True)
             return
 
         assembled = ""
@@ -283,7 +283,7 @@ class AdvancedQwen3VLApp:
         for chunk in chunks:
             assembled += chunk
             history_copy[-1][1] = f"🤖 {assembled}▌"
-            yield self._clone_history(history_copy), original_text, "🤖 正在生成..."
+            yield self._clone_history(history_copy), original_text, gr.update(value=f"🤖 {assembled}▌", visible=True)
 
         stats = (
             f"⏱️ 生成时间: {generation_time:.2f}秒 | 📝 生成长度: {len(response)}字符"
@@ -293,7 +293,7 @@ class AdvancedQwen3VLApp:
             stats += " | ⏳ 提示: 较大的最大长度可能延长生成时间"
         history_copy[-1][1] = f"🤖 {response}"
         self.chat_history = self._clone_history(history_copy)
-        yield self._clone_history(history_copy), original_text, stats
+        yield self._clone_history(history_copy), original_text, gr.update(value=stats, visible=True)
 
     def _sanitize_markdown(self, text: str) -> str:
         if not text:
@@ -896,7 +896,14 @@ def create_advanced_interface():
 
         def _clear_all():
             app.clear_history()
-            return [], "", "", gr.update(interactive=False), ""
+            return (
+                [],
+                "",
+                gr.update(value="", visible=False),
+                gr.update(value="（识别结果会以 Markdown 渲染，包括表格）", visible=True),
+                gr.update(interactive=False),
+                "",
+            )
 
         send_btn.click(
             app.chat_with_image,
@@ -912,7 +919,7 @@ def create_advanced_interface():
 
         clear_btn.click(
             _clear_all,
-            outputs=[chatbot, text_input, stats_output, save_style_btn, ocr_export_status]
+            outputs=[chatbot, text_input, stats_output, ocr_md, save_style_btn, ocr_export_status]
         )
 
         export_btn.click(
