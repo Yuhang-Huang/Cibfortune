@@ -24,8 +24,8 @@ Qwen3-VL-8B-Instruct是Qwen系列中最强大的视觉语言模型，具有以�
 
 ### Web界面（推荐）
 - `launch_web.py` - Web界面启动器（推荐）
+- `gradio_unified.py` - 统一Web界面（通用版 / 专业版一站式体验）
 - `gradio_app.py` - 基础Web界面
-- `gradio_advanced.py` - 高级Web界面
 - `start_web.py` - 简单启动脚本
 
 ### 辅助文件
@@ -42,14 +42,13 @@ Qwen3-VL-8B-Instruct是Qwen系列中最强大的视觉语言模型，具有以�
 启动友好的Web界面：
 
 ```bash
-# 启动Web界面（推荐）
+# 启动统一界面（推荐）
 python launch_web.py
 
 # 或者直接启动基础界面
 python gradio_app.py
-
-# 或者启动高级界面
-python gradio_advanced.py
+# 或者直接启动统一界面
+python gradio_unified.py
 ```
 
 ### 命令行使用

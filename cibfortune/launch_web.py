@@ -97,28 +97,6 @@ def check_model():
     print("✅ 模型检查通过")
     return True
 
-# def launch_basic_interface():
-#     """启动基础界面"""
-#     print("🚀 启动基础界面...")
-#     print("界面地址: http://localhost:7860")
-    
-#     try:
-#         from gradio_app import main as gradio_main
-#         gradio_main()
-#     except Exception as e:
-#         print(f"❌ 启动失败: {e}")
-
-# def launch_advanced_interface():
-#     """启动高级界面"""
-#     print("🚀 启动高级界面...")
-#     print("界面地址: http://localhost:7861")
-    
-#     try:
-#         from gradio_advanced import main as advanced_main
-#         advanced_main()
-#     except Exception as e:
-#         print(f"❌ 启动失败: {e}")
-
 def show_interface_menu():
     """显示界面选择菜单"""
     print("\n" + "="*60)

@@ -10,11 +10,17 @@ import json
 import inspect
 import io
 import hashlib
+import time
+import csv
+import html
 from datetime import datetime
-import gradio as gr
 import shutil
 import atexit
 import gc
+
+import gradio as gr
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
 try:
     import torch
 except Exception:
@@ -23,8 +29,623 @@ except Exception:
 # 统一环境变量
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-# 直接复用高级版应用的能力（包含基础能力的超集）
-from gradio_advanced import AdvancedQwen3VLApp
+class AdvancedQwen3VLApp:
+    """高级Qwen3-VL应用类"""
+
+    def __init__(self):
+        self.model = None
+        self.processor = None
+        self.model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
+        self.is_loaded = False
+        self.chat_history = []
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.chat_messages = []
+        self.last_image = None
+        self.last_saved_image_path = None
+        self.last_image_digest = None
+        self.last_ocr_markdown = None
+        self.last_ocr_html = None
+
+    def load_model(self, progress=gr.Progress()):
+        """加载模型"""
+        if self.is_loaded:
+            return "✅ 模型已经加载完成！", gr.update(interactive=True)
+
+        if torch is None:
+            return "❌ 模型加载失败: 未检测到PyTorch，请先安装。", gr.update(interactive=False)
+
+        try:
+            progress(0.1, desc="检查模型路径...")
+            if not os.path.exists(self.model_path):
+                return f"❌ 模型路径不存在: {self.model_path}", gr.update(interactive=False)
+
+            progress(0.3, desc="加载模型...")
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                self.model_path,
+                dtype="auto",
+                device_map="auto"
+            )
+
+            progress(0.7, desc="加载处理器...")
+            self.processor = AutoProcessor.from_pretrained(self.model_path)
+
+            progress(1.0, desc="完成！")
+            self.is_loaded = True
+
+            return "✅ 模型加载成功！可以开始使用了。", gr.update(interactive=True)
+
+        except Exception as e:
+            return f"❌ 模型加载失败: {str(e)}", gr.update(interactive=False)
+
+    def _prepare_user_message(self, image, prompt):
+        prompt_clean = (prompt or "").strip()
+        resolved_image = image if image is not None else self.last_image
+        if resolved_image is None:
+            raise ValueError("❌ 请上传图像！")
+        if not prompt_clean:
+            raise ValueError("❌ 请输入问题！")
+        if image is not None:
+            self.last_image = image
+        content = [
+            {"type": "image", "image": resolved_image},
+            {"type": "text", "text": prompt_clean},
+        ]
+        return prompt_clean, {"role": "user", "content": content}
+
+    def _run_inference(self,
+                       image,
+                       prompt,
+                       max_tokens,
+                       temperature,
+                       top_p,
+                       top_k,
+                       repetition_penalty,
+                       prepared=None):
+        if prepared is None:
+            prompt_clean, user_message = self._prepare_user_message(image, prompt)
+        else:
+            prompt_clean, user_message = prepared
+        messages = self.chat_messages + [user_message]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        generation_kwargs = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "do_sample": True if temperature > 0 else False,
+            "repetition_penalty": repetition_penalty
+        }
+
+        start_time = time.time()
+        with torch.no_grad():
+            generated_ids = self.model.generate(**inputs, **generation_kwargs)
+        generation_time = time.time() - start_time
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        response = output_text[0]
+
+        assistant_message = {"role": "assistant", "content": [{"type": "text", "text": response}]}
+        self.chat_messages.extend([user_message, assistant_message])
+        return prompt_clean, response, generation_time
+
+    def _clone_history(self, history):
+        return [[turn[0], turn[1]] for turn in history]
+
+    def _chunk_response(self, text, chunk_size=80):
+        if not text:
+            return []
+        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    def _parse_markdown_sections(self, markdown_text):
+        """
+        将 Markdown 文本拆分为 table/text 段，支持：
+        - 管道表格（| a | b |）
+        - HTML <table>（若存在）
+        并在解析前对围栏代码块进行去围栏清洗，确保导出与渲染一致。
+        """
+        sections = []
+        if not markdown_text:
+            return sections
+
+        # 1) 先去掉围栏，使得“代码块中的表格”也能被识别为可导出的内容
+        cleaned_md = self._sanitize_markdown(markdown_text)
+
+        # 2) 先尝试解析 HTML 表格（若模型输出了 <table>）
+        html_tables = []
+        try:
+            from bs4 import BeautifulSoup  # 可选依赖
+            soup = BeautifulSoup(cleaned_md, "html.parser")
+            for t in soup.find_all("table"):
+                headers = []
+                header_row = t.find("tr")
+                if header_row:
+                    # 如果有 <th> 用 th；否则用首行的 td 作为 header
+                    ths = header_row.find_all("th")
+                    if ths:
+                        headers = [th.get_text(strip=True) for th in ths]
+                        data_rows = header_row.find_next_siblings("tr")
+                    else:
+                        tds = header_row.find_all("td")
+                        headers = [td.get_text(strip=True) for td in tds]
+                        data_rows = header_row.find_next_siblings("tr")
+                rows = []
+                for r in (data_rows or []):
+                    cols = r.find_all(["td", "th"])
+                    rows.append([c.get_text(strip=True) for c in cols])
+                if headers or rows:
+                    html_tables.append({"type": "table", "header": headers, "rows": rows})
+        except Exception:
+            # 如果 bs4 不在环境中，则略过 HTML 解析
+            pass
+
+        # 3) 解析管道表格
+        lines = cleaned_md.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            # 管道表格判定：当前行和下一行构成 header + 分隔
+            is_table = (
+                stripped.startswith("|")
+                and stripped.count("|") >= 2
+                and i + 1 < len(lines)
+                and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
+                and lines[i + 1].strip().startswith("|")
+            )
+
+            if is_table:
+                header = [cell.strip() for cell in stripped.strip("|").split("|")]
+                i += 2  # 跳过 header 与分隔线
+                rows = []
+                while i < len(lines):
+                    row_line = lines[i].strip()
+                    if not (row_line.startswith("|") and row_line.count("|") >= 2):
+                        break
+                    row = [cell.strip() for cell in row_line.strip("|").split("|")]
+                    rows.append(row)
+                    i += 1
+                sections.append({"type": "table", "header": header, "rows": rows})
+                continue
+
+            # 普通文本块（直到遇到下一个表格或文件结束）
+            text_block = []
+            while i < len(lines):
+                current = lines[i]
+                stripped_current = current.strip()
+                next_is_table = (
+                    stripped_current.startswith("|")
+                    and stripped_current.count("|") >= 2
+                    and i + 1 < len(lines)
+                    and set(lines[i + 1].replace("|", "").strip()) <= set("-: ")
+                    and lines[i + 1].strip().startswith("|")
+                )
+                if next_is_table:
+                    break
+                text_block.append(current)
+                i += 1
+                # 保留空行，改善段落分隔的可读性
+                if i < len(lines) and lines[i] == "":
+                    text_block.append(lines[i])
+
+            text_content = "\n".join(text_block).strip("\n")
+            if text_content:
+                sections.append({"type": "text", "text": text_content})
+
+        # 4) 若存在 HTML 表，优先把 HTML 表也加入（放在解析结果前面，避免遗漏）
+        if html_tables:
+            # 将 HTML 表插在最前面（也可根据需要合并/去重）
+            sections = html_tables + sections
+
+        return sections
+
+    @staticmethod
+    def _text_to_html_block(text: str) -> str:
+        if not text:
+            return ""
+        escaped = html.escape(text)
+        replaced = escaped.replace("\n", "<br>")
+        return f'<div class="ocr-text">{replaced}</div>'
+
+    @staticmethod
+    def _table_to_html_block(header, rows) -> str:
+        header = header or []
+        rows = rows or []
+        thead = ""
+        if header:
+            header_cells = "".join(f"<th>{html.escape(str(cell))}</th>" for cell in header)
+            thead = f"<thead><tr>{header_cells}</tr></thead>"
+        body_rows = []
+        for row in rows:
+            row_cells = "".join(f"<td>{html.escape(str(cell))}</td>" for cell in row)
+            body_rows.append(f"<tr>{row_cells}</tr>")
+        tbody = f"<tbody>{''.join(body_rows)}</tbody>" if body_rows else "<tbody></tbody>"
+        return f'<table class="ocr-table">{thead}{tbody}</table>'
+
+    def _render_sections_as_html(self, markdown_text: str) -> str:
+        if not markdown_text:
+            return ""
+        sections = self._parse_markdown_sections(markdown_text)
+        if not sections:
+            escaped = html.escape(markdown_text.strip())
+            return f"<pre>{escaped}</pre>" if escaped else ""
+        blocks = []
+        for section in sections:
+            if section.get("type") == "table":
+                blocks.append(self._table_to_html_block(section.get("header"), section.get("rows")))
+            elif section.get("type") == "text":
+                blocks.append(self._text_to_html_block(section.get("text", "")))
+        return '<div class="ocr-preview">' + "".join(blocks) + "</div>"
+
+    def chat_with_image(self, image, text, history, max_tokens, temperature, top_p, top_k, repetition_penalty: float = 1.0, presence_penalty: float = 1.5):
+        """与图像对话（流式反馈）"""
+        original_text = text
+
+        if not self.is_loaded:
+            yield history, original_text, "❌ 请先加载模型！"
+            return
+
+        try:
+            prepared = self._prepare_user_message(image, text)
+        except ValueError as exc:
+            yield history, original_text, str(exc)
+            return
+
+        prompt_clean, _ = prepared
+        history_copy = self._clone_history(history)
+        history_copy.append([f"👤 {prompt_clean}", "🤖 正在思考..."])
+        yield self._clone_history(history_copy), original_text, "🤖 正在思考..."
+
+        try:
+            _, response, generation_time = self._run_inference(
+                image,
+                text,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                prepared=prepared
+            )
+        except Exception as e:
+            history_copy[-1][1] = f"❌ 生成失败: {str(e)}"
+            self.chat_history = self._clone_history(history_copy)
+            yield self._clone_history(history_copy), original_text, f"❌ 错误: {str(e)}"
+            return
+
+        assembled = ""
+        chunks = self._chunk_response(response)
+        if not chunks:
+            chunks = [""]
+        for chunk in chunks:
+            assembled += chunk
+            history_copy[-1][1] = f"🤖 {assembled}▌"
+            yield self._clone_history(history_copy), original_text, f"🤖 {assembled}▌"
+
+        stats = (
+            f"⏱️ 生成时间: {generation_time:.2f}秒 | 📝 生成长度: {len(response)}字符"
+            f" | ⚙️ 最大长度: {max_tokens}"
+        )
+        if max_tokens > 1024:
+            stats += " | ⏳ 提示: 较大的最大长度可能延长生成时间"
+        history_copy[-1][1] = f"🤖 {response}"
+        self.chat_history = self._clone_history(history_copy)
+        yield self._clone_history(history_copy), original_text, stats
+
+    def _sanitize_markdown(self, text: str) -> str:
+        if not text:
+            return ""
+        s = text.strip()
+        lines = s.splitlines()
+        out = []
+        in_fence = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence:
+                out.append(line)
+        cleaned = "\n".join(out).strip()
+        return cleaned if cleaned else s
+
+    def ocr_analysis(self, image, prompt: str = None):
+        """OCR文字识别，可选自定义提示词"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        default_prompt = (
+            "请识别并提取这张图片中的所有文字内容，尽量还原原本样式，并标注语言类型。"
+            " 请确保所有带样式或表格内容使用Markdown表格表示。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=1024,
+                temperature=0.7,
+                top_p=0.8,
+                top_k=50,
+                repetition_penalty=1.0
+            )
+            cleaned = self._sanitize_markdown(response)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
+            self.last_ocr_markdown = f"## OCR识别结果\n\n{cleaned}"
+            self.last_ocr_html = "<h2>OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
+            return f"📝 OCR识别结果:\n\n{cleaned}"
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ OCR识别失败: {str(e)}"
+
+    def spatial_analysis(self, image, prompt: str = None):
+        """空间感知分析，可选自定义提示词"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        default_prompt = (
+            "请分析这张图片中的空间关系，包括相对位置、视角、遮挡、深度与距离感，并给出整体布局描述。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=768,
+                temperature=0.7,
+                top_p=0.8,
+                top_k=50,
+                repetition_penalty=1.0
+            )
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            return f"📐 空间分析结果:\n\n{response}"
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ 空间分析失败: {str(e)}"
+
+    def visual_coding(self, image, output_format: str = "HTML", prompt: str = None):
+        """视觉编程生成代码，可选自定义提示词"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        base_prompts = {
+            "HTML": "请根据图片生成对应的HTML结构代码，包含必要的语义标签。",
+            "CSS": "请为该图片对应的界面生成合理的CSS样式代码，包括布局与颜色。",
+            "JavaScript": "请根据图片交互生成JavaScript代码示例，包含必要的事件与逻辑。",
+            "Python": "请生成能复现该界面/布局的Python示例代码（如使用streamlit或flask的伪代码）。",
+        }
+        default_prompt = base_prompts.get(output_format, base_prompts["HTML"]) + " 请只输出代码，不要额外说明。"
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=1024,
+                temperature=0.4,
+                top_p=0.8,
+                top_k=50,
+                repetition_penalty=1.0
+            )
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {response}"])
+            return response
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ 视觉编程失败: {str(e)}"
+
+    def batch_analysis(self, images, analysis_type):
+        """批量分析"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+
+        if not images:
+            return "❌ 请上传图像！"
+
+        results = []
+
+        for i, image in enumerate(images):
+            try:
+                if analysis_type == "描述":
+                    prompt = "请真实、详细、客观地描述这张图片的内容。"
+                elif analysis_type == "OCR":
+                    prompt = "请识别并提取这张图片中的所有文字内容，尽量还原原本样式，并标注语言类型。"
+                elif analysis_type == "空间分析":
+                    prompt = "请分析这张图片中的空间关系和物体位置，包括相对位置、视角、遮挡、深度与距离感，并给出整体布局描述。"
+                elif analysis_type == "情感分析":
+                    prompt = "请分析这张图片传达的情感或氛围。"
+                else:
+                    prompt = "请分析这张图片。"
+
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ]
+
+                inputs = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt"
+                )
+                inputs = inputs.to(self.model.device)
+
+                with torch.no_grad():
+                    generated_ids = self.model.generate(**inputs, max_new_tokens=512)
+
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                output_text = self.processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )
+
+                results.append(f"📷 图像 {i+1}:\n{output_text[0]}\n" + "="*50 + "\n")
+
+            except Exception as e:
+                results.append(f"📷 图像 {i+1}: ❌ 分析失败 - {str(e)}\n" + "="*50 + "\n")
+
+        return "".join(results)
+
+    def compare_images(self, image1, image2, comparison_type):
+        """图像对比"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+
+        if image1 is None or image2 is None:
+            return "❌ 请上传两张图像进行对比！"
+
+        try:
+            if comparison_type == "相似性":
+                prompt = "请对比这两张图片，分析它们的相似之处和不同之处。"
+            elif comparison_type == "风格":
+                prompt = "请对比这两张图片的艺术风格、色彩搭配和构图特点。"
+            elif comparison_type == "内容":
+                prompt = "请对比这两张图片的内容，分析它们描述的场景或主题。"
+            else:
+                prompt = "请对比这两张图片，提供详细的对比分析。"
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image1},
+                        {"type": "image", "image": image2},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+            inputs = inputs.to(self.model.device)
+
+            with torch.no_grad():
+                generated_ids = self.model.generate(**inputs, max_new_tokens=1024)
+
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+
+            return f"🔍 对比分析结果:\n\n{output_text[0]}"
+
+        except Exception as e:
+            return f"❌ 对比分析失败: {str(e)}"
+
+    def export_chat_history(self):
+        """导出对话历史"""
+        if not self.chat_history:
+            return "❌ 没有对话历史可导出！"
+
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"chat_history_{timestamp}.json"
+
+            # 保存为JSON格式
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(self.chat_history, f, ensure_ascii=False, indent=2)
+
+            return f"✅ 对话历史已导出到: {filename}"
+
+        except Exception as e:
+            return f"❌ 导出失败: {str(e)}"
+
+    def clear_history(self):
+        """清空对话历史"""
+        self.chat_history = []
+        self.chat_messages = []
+        self.last_image = None
+        self.last_saved_image_path = None
+        self.last_image_digest = None
+        self.last_ocr_markdown = None
+        self.last_ocr_html = None
+        if hasattr(self, "session_turn_image_paths"):
+            self.session_turn_image_paths.clear()
+        return []
+
+    def export_last_ocr(self):
+        if not self.last_ocr_markdown:
+            return "❌ 没有可保存的文本样式，请先执行一次OCR识别！"
+
+        export_dir = os.path.join("ocr_exports")
+        os.makedirs(export_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sections = self._parse_markdown_sections(self.last_ocr_markdown)
+
+        excel_path = os.path.join(export_dir, f"ocr_{timestamp}.xlsx")
+        excel_note = ""
+        try:
+            from openpyxl import Workbook
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "表格1" if sections else "OCR文本"
+            table_idx = 0
+            for section in sections:
+                if section["type"] == "table":
+                    table_idx += 1
+                    if table_idx > 1:
+                        ws = wb.create_sheet(title=f"表格{table_idx}")
+                    ws.append(section["header"])
+                    for row in section["rows"]:
+                        ws.append(row)
+                elif section["type"] == "text" and section["text"]:
+                    if table_idx > 0:
+                        ws = wb.create_sheet(title=f"文本{table_idx}")
+                    for line in section["text"].splitlines():
+                        ws.append([line])
+            if not sections:
+                for line in self.last_ocr_markdown.splitlines():
+                    ws.append([line])
+            wb.save(excel_path)
+        except Exception as exc:
+            excel_path = os.path.join(export_dir, f"ocr_{timestamp}.csv")
+            with open(excel_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["OCR Result"])
+                for line in self.last_ocr_markdown.splitlines():
+                    writer.writerow([line])
+            excel_note = f"⚠️ Excel导出失败({exc})，已保存为CSV"
+
+        json_path = os.path.join(export_dir, f"ocr_{timestamp}.json")
+        json_content = {
+            "markdown": self.last_ocr_markdown,
+            "sections": sections,
+        }
+        with open(json_path, "w", encoding='utf-8') as f:
+            json.dump(json_content, f, ensure_ascii=False, indent=2)
+
+        message_lines = [
+            "✅ 文本样式已保存：",
+            f"- Excel: {excel_path}" + (f" ({excel_note})" if excel_note else ""),
+            f"- JSON: {json_path}",
+        ]
+        return "\n".join(message_lines)
 
 
 DEFAULT_TASK_PROMPTS = {
@@ -40,6 +661,14 @@ VISUAL_CODING_PROMPTS = {
     "JavaScript": "请根据图片交互生成JavaScript代码示例，包含必要的事件与逻辑。请只输出代码，不要额外说明。",
     "Python": "请生成能复现该界面/布局的Python示例代码（如使用streamlit或flask的伪代码）。请只输出代码，不要额外说明。",
 }
+
+
+def _plain_text_to_html(text: str) -> str:
+    if not text:
+        return ""
+    escaped = html.escape(str(text))
+    replaced = escaped.replace("\n", "<br>")
+    return f'<div class="stats-text">{replaced}</div>'
 
 
 def _get_default_prompt(task: str, code_format: str = None) -> str:
@@ -169,7 +798,7 @@ def handle_unified_chat(image,
                         record_image_path()
                     app.chat_history = out_history
                     button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-                    stats_update = gr.update(value=stats, visible=True)
+                    stats_update = gr.update(value=_plain_text_to_html(stats), visible=True)
                     yield out_history, cleared, stats_update, button_update, gr.update(value="", visible=True)
             else:
                 out_history, cleared, stats = chat_result
@@ -177,14 +806,14 @@ def handle_unified_chat(image,
                     record_image_path()
                 app.chat_history = out_history
                 button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-                stats_update = gr.update(value=stats, visible=True)
+                stats_update = gr.update(value=_plain_text_to_html(stats), visible=True)
                 yield out_history, cleared, stats_update, button_update, gr.update(value="", visible=True)
 
         else:
             task = pro_task or "任务问答"
             if task == "OCR识别":
                 if image is None:
-                    stats_update = gr.update(value="❌ 请上传图像！", visible=True)
+                    stats_update = gr.update(value=_plain_text_to_html("❌ 请上传图像！"), visible=True)
                     yield history, text, stats_update, gr.update(interactive=False), "❌ 请上传图像！"
                     return
 
@@ -200,7 +829,8 @@ def handle_unified_chat(image,
                 app.chat_history = updated_history
                 if not image_recorded:
                     record_image_path()
-                stats_update = gr.update(value=app.last_ocr_markdown, visible=True)
+                ocr_preview = app.last_ocr_html or _plain_text_to_html(app.last_ocr_markdown or "")
+                stats_update = gr.update(value=ocr_preview, visible=True)
                 status_update = "✅ OCR识别完成，可导出样式"
                 yield updated_history, "", stats_update, gr.update(interactive=bool(app.last_ocr_markdown)), status_update
                 return
@@ -224,7 +854,7 @@ def handle_unified_chat(image,
                         record_image_path()
                     app.chat_history = out_history
                     button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-                    stats_update = gr.update(value=stats, visible=True)
+                    stats_update = gr.update(value=_plain_text_to_html(stats), visible=True)
                     yield out_history, cleared, stats_update, button_update, gr.update()
             else:
                 out_history, cleared, stats = chat_result
@@ -232,7 +862,7 @@ def handle_unified_chat(image,
                     record_image_path()
                 app.chat_history = out_history
                 button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-                stats_update = gr.update(value=stats, visible=True)
+                stats_update = gr.update(value=_plain_text_to_html(stats), visible=True)
                 yield out_history, cleared, stats_update, button_update, gr.update()
 
         if not image_recorded and len(app.chat_history) > prev_turns:
@@ -244,7 +874,7 @@ def handle_unified_chat(image,
         if not image_recorded and len(history) > prev_turns:
             record_image_path()
         button_update = gr.update(interactive=bool(app.last_ocr_markdown))
-        stats_update = gr.update(value=f"❌ 错误: {str(e)}", visible=True)
+        stats_update = gr.update(value=_plain_text_to_html(f"❌ 错误: {str(e)}"), visible=True)
         yield history, text, stats_update, button_update, f"❌ 错误: {str(e)}"
 
 
@@ -442,12 +1072,16 @@ def create_unified_interface():
         border-color: var(--accent);
         box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
     }
-    #unified-stats textarea {
+    #unified-stats .stats-text {
         background: var(--accent-soft);
         border-radius: 16px;
         border: 1px solid rgba(37, 99, 235, 0.2);
         color: var(--text-primary);
         font-weight: 500;
+        padding: 12px 14px;
+        line-height: 1.6;
+        margin-bottom: 12px;
+        word-break: break-word;
     }
     .gradio-container .gradio-button.primary {
         background: linear-gradient(135deg, #2563eb, #1d4ed8);
@@ -629,7 +1263,7 @@ def create_unified_interface():
                             clear_btn = gr.Button("🗑️ 清空历史", variant="secondary", scale=1)
                         with gr.Row():
                             with gr.Column(scale=4):
-                                stats_output = gr.Markdown(
+                                stats_output = gr.HTML(
                                     value="",
                                     visible=False,
                                     elem_id="unified-stats"
