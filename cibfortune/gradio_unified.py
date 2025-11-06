@@ -13,6 +13,7 @@ import hashlib
 import time
 import csv
 import html
+import numpy as np
 from datetime import datetime
 import shutil
 import atexit
@@ -20,6 +21,7 @@ import gc
 
 import gradio as gr
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from ocr_card_rag_api import CardOCRWithRAG
 
 try:
     import torch
@@ -35,7 +37,7 @@ class AdvancedQwen3VLApp:
     def __init__(self):
         self.model = None
         self.processor = None
-        self.model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
+        self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
         self.is_loaded = False
         self.chat_history = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -45,6 +47,54 @@ class AdvancedQwen3VLApp:
         self.last_image_digest = None
         self.last_ocr_markdown = None
         self.last_ocr_html = None
+        # 卡证OCR多模态RAG组件
+        self.card_rag_store = None
+        self.card_rag_ready = False
+        self.card_rag_dir = "rag_cards"
+        # API 卡证OCR（RAG + Qwen API）
+        self.card_api = None
+
+    def _ensure_card_rag_loaded(self):
+        """懒加载卡证RAG图片库（若存在 rag_cards 目录）。"""
+        if self.card_rag_ready:
+            return
+        try:
+            if not os.path.isdir(self.card_rag_dir):
+                self.card_rag_ready = True  # 标记为已尝试，避免重复检查
+                return
+            from multimodal_rag import MultiModalDocumentLoader, MultiModalVectorStore
+            loader = MultiModalDocumentLoader()
+            docs = loader.load_images_from_folder(self.card_rag_dir)
+            if not docs:
+                self.card_rag_ready = True
+                return
+            store = MultiModalVectorStore(persist_directory="./multimodal_chroma_card")
+            store.create_vector_store(docs)
+            self.card_rag_store = store
+            self.card_rag_ready = True
+        except Exception:
+            print("加载RAG图片库失败")
+
+    def _ensure_card_api_loaded(self):
+        """懒加载卡证OCR API（RAG增强 + Qwen API 客户端）"""
+        if self.card_api is not None:
+            return
+        try:
+            api = CardOCRWithRAG(
+                api_key=None,
+                model="qwen-vl-plus",
+                rag_image_dir=self.card_rag_dir,
+                persist_directory="./multimodal_chroma_card",
+            )
+            api.load_model()
+            api.load_rag_library()
+            self.card_api = api
+        except Exception:
+            self.card_api = None
+        except Exception:
+            # RAG 初始化失败时忽略，走纯模型路径
+            self.card_rag_store = None
+            self.card_rag_ready = True
 
     def load_model(self, progress=gr.Progress()):
         """加载模型"""
@@ -63,7 +113,8 @@ class AdvancedQwen3VLApp:
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_path,
                 dtype="auto",
-                device_map="auto"
+                device_map="cuda",
+                load_in_4bit=True,
             )
 
             progress(0.7, desc="加载处理器...")
@@ -391,6 +442,160 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             return f"❌ OCR识别失败: {str(e)}"
 
+    def ocr_card(self, image, prompt: str = None):
+        """卡证OCR识别：身份证/银行卡/驾驶证等结构化提取"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        default_prompt = (
+            "你是专业的卡证OCR引擎。请对图片进行结构化识别：\n"
+            "1) 判断卡证类型（身份证/银行卡/驾驶证/护照/工牌/其他）；\n"
+            "2) 以Markdown表格输出关键字段和值；字段示例：姓名/姓名(EN)、性别、民族、生日、住址、公民身份号码、签发机关、有效期限、卡号、有效期、发卡行等；\n"
+            "3) 若有头像或水印信息，请在表格下方以文本补充说明；\n"
+            "4) 保持原图文字内容尽量完整，不要输出围栏代码块；\n"
+            "5) 如果和给定的卡证图片库中的图片相似，请在表格下方给出相似度，并给出相似卡证的图片名称。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+
+        # 先尝试进行基于图片库的多模态RAG检索，获取相似卡证参考
+        rag_prefix = ""
+        try:
+            self._ensure_card_rag_loaded()
+            if self.card_rag_store and getattr(self.card_rag_store, "image_embeddings", None):
+                query_emb = self.card_rag_store.embeddings.embed_image(image)
+                sims = []
+                for idx, emb in enumerate(self.card_rag_store.image_embeddings):
+                    # 余弦相似度
+                    denom = (np.linalg.norm(query_emb) * np.linalg.norm(emb) + 1e-8)
+                    sim = float(np.dot(query_emb, emb) / denom) if denom > 0 else 0.0
+                    sims.append((sim, idx))
+                sims.sort(key=lambda x: x[0], reverse=True)
+                topk = sims[:3]
+                if topk:
+                    lines = ["基于图片库检索到的相似卡证（仅作格式/字段参考，勿臆断）："]
+                    for rank, (sim, idx) in enumerate(topk, 1):
+                        meta = self.card_rag_store.image_metadatas[idx] if idx < len(self.card_rag_store.image_metadatas) else {}
+                        fname = meta.get("filename") or os.path.basename(meta.get("source", "")) or f"示例{rank}"
+                        lines.append(f"- 参考{rank}: {fname} | 相似度={sim:.3f}")
+                    rag_prefix = "\n".join(lines) + "\n\n"
+        except Exception:
+            rag_prefix = ""
+
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                (rag_prefix + effective_prompt) if rag_prefix else effective_prompt,
+                max_tokens=1024,
+                temperature=0.3,
+                top_p=0.8,
+                top_k=40,
+                repetition_penalty=1.05
+            )
+            cleaned = self._sanitize_markdown(response)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
+            self.last_ocr_markdown = f"## 卡证OCR识别结果\n\n{cleaned}"
+            self.last_ocr_html = "<h2>卡证OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
+            return f"🪪 卡证OCR识别结果:\n\n{cleaned}"
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ 卡证OCR识别失败: {str(e)}"
+
+    def ocr_card_api(self, image, prompt: str = None):
+        """卡证OCR识别（API调用 + RAG增强）"""
+        # 注：如无需强制本地模型加载，可移除此判断
+        try:
+            self._ensure_card_api_loaded()
+            if self.card_api is None:
+                return "�?卡证OCR API初始化失败"
+
+            default_prompt = (
+                "你是专业的卡证OCR引擎。请对图片进行结构化识别：\n"
+                "1) 判断卡证类型（身份证/银行卡/驾驶证/护照/工牌/其他）；\n"
+                "2) 以Markdown表格输出关键字段和值；字段示例：姓名、姓名(EN)、性别、民族、生日、住址、公民身份号码、签发机关、有效期限、卡号、有效期、发卡行等；\n"
+                "3) 若有头像或水印信息，请在表格下方以文本补充说明；\n"
+                "4) 保持原图文字内容尽量完整，不要输出围栏代码块。"
+            )
+            effective_prompt = (prompt or "").strip() or default_prompt
+            result = self.card_api.recognize_card(
+                image,
+                custom_prompt=effective_prompt,
+                use_rag=True,
+            )
+            if not result.get("success"):
+                return f"�?卡证OCR API调用失败: {result.get('error') or '未知错误'}"
+
+            cleaned = self._sanitize_markdown(result.get("result") or "")
+            self.last_ocr_markdown = f"## 卡证OCR识别（API）结果\n\n{cleaned}"
+            self.last_ocr_html = "<h2>卡证OCR识别（API）结果</h2>" + self._render_sections_as_html(cleaned)
+            return f"🪪 卡证OCR识别（API）结果:\n\n{cleaned}"
+        except Exception as e:
+            return f"�?卡证OCR API识别失败: {str(e)}"
+
+    def ocr_receipt(self, image, prompt: str = None):
+        """票据OCR识别：发票/小票等表格与关键项解析"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        default_prompt = (
+            "你是发票/小票OCR专家。请解析图片中的票据并输出：\n"
+            "- 以Markdown表格给出关键信息：票据类型、开票日期、发票代码、发票号码、校验码、购买方、销售方、税号、项目、数量、单价、金额、税率、税额、合计金额(含税/不含税)；\n"
+            "- 若检测到多行项目，请以表格形式逐行列出；\n"
+            "- 表格下方给出识别置信度与可疑项提示；\n"
+            "- 不要使用围栏代码块，保持Markdown可渲染。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=1536,
+                temperature=0.2,
+                top_p=0.8,
+                top_k=40,
+                repetition_penalty=1.05
+            )
+            cleaned = self._sanitize_markdown(response)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
+            self.last_ocr_markdown = f"## 票据OCR识别结果\n\n{cleaned}"
+            self.last_ocr_html = "<h2>票据OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
+            return f"🧾 票据OCR识别结果:\n\n{cleaned}"
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ 票据OCR识别失败: {str(e)}"
+
+    def ocr_agreement(self, image, prompt: str = None):
+        """协议OCR识别：合同/协议段落与条款解析"""
+        if not self.is_loaded:
+            return "❌ 请先加载模型！"
+        default_prompt = (
+            "你是合同/协议OCR与条款解析助手。请完成：\n"
+            "1) 识别全文，保持段落结构；\n"
+            "2) 以Markdown表格提炼关键信息：合同名称、甲方、乙方、签署日期、生效日期、终止日期、金额/币种、违约条款、争议解决、签章情况；\n"
+            "3) 如有编号的条款，保留编号并逐条列出；\n"
+            "4) 在末尾给出“风险提示”列表（如空白处、涂改处、关键要素缺失等）；\n"
+            "5) 不要输出围栏代码块。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+        try:
+            prompt_clean, response, _ = self._run_inference(
+                image,
+                effective_prompt,
+                max_tokens=2048,
+                temperature=0.3,
+                top_p=0.8,
+                top_k=40,
+                repetition_penalty=1.05
+            )
+            cleaned = self._sanitize_markdown(response)
+            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
+            self.last_ocr_markdown = f"## 协议OCR识别结果\n\n{cleaned}"
+            self.last_ocr_html = "<h2>协议OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
+            return f"📄 协议OCR识别结果:\n\n{cleaned}"
+        except ValueError as exc:
+            return str(exc)
+        except Exception as e:
+            return f"❌ 协议OCR识别失败: {str(e)}"
+
     def spatial_analysis(self, image, prompt: str = None):
         """空间感知分析，可选自定义提示词"""
         if not self.is_loaded:
@@ -651,6 +856,9 @@ class AdvancedQwen3VLApp:
 DEFAULT_TASK_PROMPTS = {
     "任务问答": "请根据图片完成指定任务，并给出详细的分析与结论。",
     "OCR识别": "请识别并提取这张图片中的所有文字内容，并标注语言类型。请确保所有带样式或表格内容使用Markdown表格表示。",
+    "卡证OCR识别": "请进行卡证类识别并以Markdown表格输出关键字段（如姓名、证件号、有效期、卡号等），并在下方补充备注。",
+    "票据OCR识别": "请解析发票/小票等票据，输出关键信息和多行项目表格，并在下方给出置信度与可疑项。",
+    "协议OCR识别": "请提取合同/协议关键信息（甲乙方、日期、金额、条款等），保留段落与条款编号，并在末尾给出风险提示。",
     "空间分析": "请分析这张图片中的空间关系，包括相对位置、视角、遮挡、深度与距离感，并给出整体布局描述。",
     "情感分析": "请分析这张图片传达的情感或氛围，并说明理由。",
 }
@@ -833,6 +1041,86 @@ def handle_unified_chat(image,
                 stats_update = gr.update(value=ocr_preview, visible=True)
                 status_update = "✅ OCR识别完成，可导出样式"
                 yield updated_history, "", stats_update, gr.update(interactive=bool(app.last_ocr_markdown)), status_update
+                return
+
+            if task == "卡证OCR识别（API）":
+                if image is None:
+                    stats_update = gr.update(value=_plain_text_to_html("❌ 请上传图像！"), visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), "❌ 请上传图像！"
+                    return
+                result = app.ocr_card_api(image)
+                if result.startswith("❌"):
+                    stats_update = gr.update(value="", visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), result
+                    return
+                prompt_text = user_text if user_text else _get_default_prompt("卡证OCR识别", code_format)
+                updated_history = history + [[f"👤 {prompt_text}", result]]
+                app.chat_history = updated_history
+                if not image_recorded:
+                    record_image_path()
+                ocr_preview = app.last_ocr_html or _plain_text_to_html(app.last_ocr_markdown or "")
+                stats_update = gr.update(value=ocr_preview, visible=True)
+                yield updated_history, "", stats_update, gr.update(interactive=bool(app.last_ocr_markdown)), "✅ 卡证OCR识别(API)完成，可导出样式"
+                return
+
+            if task == "卡证OCR识别":
+                if image is None:
+                    stats_update = gr.update(value=_plain_text_to_html("❌ 请上传图像！"), visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), "❌ 请上传图像！"
+                    return
+                result = app.ocr_card(image)
+                if result.startswith("❌"):
+                    stats_update = gr.update(value="", visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), result
+                    return
+                prompt_text = user_text if user_text else _get_default_prompt(task, code_format)
+                updated_history = history + [[f"👤 {prompt_text}", result]]
+                app.chat_history = updated_history
+                if not image_recorded:
+                    record_image_path()
+                ocr_preview = app.last_ocr_html or _plain_text_to_html(app.last_ocr_markdown or "")
+                stats_update = gr.update(value=ocr_preview, visible=True)
+                yield updated_history, "", stats_update, gr.update(interactive=bool(app.last_ocr_markdown)), "✅ 卡证OCR识别完成，可导出样式"
+                return
+
+            if task == "票据OCR识别":
+                if image is None:
+                    stats_update = gr.update(value=_plain_text_to_html("❌ 请上传图像！"), visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), "❌ 请上传图像！"
+                    return
+                result = app.ocr_receipt(image)
+                if result.startswith("❌"):
+                    stats_update = gr.update(value="", visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), result
+                    return
+                prompt_text = user_text if user_text else _get_default_prompt(task, code_format)
+                updated_history = history + [[f"👤 {prompt_text}", result]]
+                app.chat_history = updated_history
+                if not image_recorded:
+                    record_image_path()
+                ocr_preview = app.last_ocr_html or _plain_text_to_html(app.last_ocr_markdown or "")
+                stats_update = gr.update(value=ocr_preview, visible=True)
+                yield updated_history, "", stats_update, gr.update(interactive=bool(app.last_ocr_markdown)), "✅ 票据OCR识别完成，可导出样式"
+                return
+
+            if task == "协议OCR识别":
+                if image is None:
+                    stats_update = gr.update(value=_plain_text_to_html("❌ 请上传图像！"), visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), "❌ 请上传图像！"
+                    return
+                result = app.ocr_agreement(image)
+                if result.startswith("❌"):
+                    stats_update = gr.update(value="", visible=True)
+                    yield history, text, stats_update, gr.update(interactive=False), result
+                    return
+                prompt_text = user_text if user_text else _get_default_prompt(task, code_format)
+                updated_history = history + [[f"👤 {prompt_text}", result]]
+                app.chat_history = updated_history
+                if not image_recorded:
+                    record_image_path()
+                ocr_preview = app.last_ocr_html or _plain_text_to_html(app.last_ocr_markdown or "")
+                stats_update = gr.update(value=ocr_preview, visible=True)
+                yield updated_history, "", stats_update, gr.update(interactive=bool(app.last_ocr_markdown)), "✅ 协议OCR识别完成，可导出样式"
                 return
 
             effective_prompt = user_text if user_text else _get_default_prompt(task, code_format)
@@ -1189,7 +1477,7 @@ def create_unified_interface():
                     choices=["通用版", "专业版"], value="通用版", label="界面模式"
                 )
                 pro_task = gr.Dropdown(
-                    choices=["任务问答", "OCR识别", "空间分析", "视觉编程", "情感分析"],
+                    choices=["任务问答", "OCR识别", "卡证OCR识别", "卡证OCR识别（API）", "票据OCR识别", "协议OCR识别", "空间分析", "视觉编程", "情感分析"],
                     value="任务问答",
                     label="专业任务",
                     visible=False,
