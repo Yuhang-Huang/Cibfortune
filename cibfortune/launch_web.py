@@ -74,7 +74,8 @@ def install_missing_deps():
 
 def check_model():
     """检查模型"""
-    model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
+    model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+    
     
     print(f"🔍 检查模型路径: {model_path}")
     

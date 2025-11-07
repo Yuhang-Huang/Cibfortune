@@ -26,7 +26,7 @@ class Qwen3VLGradioApp:
     def __init__(self):
         self.model = None
         self.processor = None
-        self.model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
+        self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
         self.is_loaded = False
         self.chat_history = []
         self.chat_messages = []
@@ -63,7 +63,8 @@ class Qwen3VLGradioApp:
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_path,
                 dtype="auto",
-                device_map="auto"
+                device_map="cuda",
+                load_in_4bit=True,
             )
             
             progress(0.7, desc="加载处理器...")
