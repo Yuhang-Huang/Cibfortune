@@ -53,6 +53,8 @@ class AdvancedQwen3VLApp:
         self.card_rag_dir = "rag_cards"
         # API 卡证OCR（RAG + Qwen API）
         self.card_api = None
+        # 字段模板目录
+        self.field_templates_dir = "card_field_templates"
 
     def _ensure_card_rag_loaded(self):
         """懒加载卡证RAG图片库（若存在 rag_cards 目录）。"""
@@ -447,13 +449,34 @@ class AdvancedQwen3VLApp:
         if not self.is_loaded:
             return "❌ 请先加载模型！"
         default_prompt = (
-            "你是专业的卡证OCR引擎。请对图片进行结构化识别：\n"
-            "1) 判断卡证类型（身份证/银行卡/驾驶证/护照/工牌/其他）；\n"
-            "2) 以Markdown表格输出关键字段和值；字段示例：姓名/姓名(EN)、性别、民族、生日、住址、公民身份号码、签发机关、有效期限、卡号、有效期、发卡行等；\n"
-            "3) 若有头像或水印信息，请在表格下方以文本补充说明；\n"
-            "4) 保持原图文字内容尽量完整，不要输出围栏代码块；\n"
-            "5) 如果和给定的卡证图片库中的图片相似，请在表格下方给出相似度，并给出相似卡证的图片名称。"
+            "你是专业的卡证OCR引擎，请对输入图片进行结构化识别，并仅输出Markdown表格。\n"
+            "\n"
+            "任务要求如下：\n"
+            "\n"
+            "1. 识别卡证类型：只允许从以下类别中选择一种：\n"
+            "   - 身份证 / 银行卡 / 驾驶证 / 护照 / 工牌 / 其他。\n"
+            "   Markdown表格中添加“卡证类型”字段，并用类别选择赋值。\n"
+            "   **重要**：如果识别为银行卡，必须严格遵守第3条银行卡特殊要求！\n"
+            "\n"
+            "2. 输出格式：\n"
+            "   - 以Markdown表格形式输出所有识别出的关键字段及其对应的值。\n"
+            "   - 若字段中包含“卡号”，请确保该字段的值仅包含数字。\n"
+            "   - 不要使用代码块标记符号（例如 ``` ）。\n"
+            "\n"
+            "3. 银行卡特殊要求（必须严格遵守）：\n"
+            "   如果识别的卡证类型是银行卡，必须在Markdown表格的最后额外添加一个字段：\n"
+            "   - 字段名：卡面类型（必须添加，不可省略）。\n"
+            "   - 字段值规则如下：\n"
+            "     - 若识别出的发卡行名称与相似图片文件名中的银行名称一致，“卡面类型”字段的值只能从找到的相似图片名称（去掉文件后缀名）中选择，禁止自定义卡面类型。若不一致，则“卡面类型”字段的值必须为“其他”。\n"
+            "   **重要提醒**：银行卡的Markdown表格必须包含“卡面类型”字段，这是强制要求，不能省略！\n"
+            "   - 如果不是银行卡，则不添加“卡面类型”字段。\n"
+            "\n"
+            "4. 输出限制：\n"
+            "   - 最终输出只包含Markdown表格及必要的头像/水印说明。\n"
+            "   - 禁止输出任何其他文字或解释性内容。\n"
+            "   - 如果是银行卡，表格中必须包含“卡面类型”字段，否则输出不完整。\n"
         )
+
         effective_prompt = (prompt or "").strip() or default_prompt
 
         # 先尝试进行基于图片库的多模态RAG检索，获取相似卡证参考
@@ -507,14 +530,38 @@ class AdvancedQwen3VLApp:
             self._ensure_card_api_loaded()
             if self.card_api is None:
                 return "�?卡证OCR API初始化失败"
-
             default_prompt = (
-                "你是专业的卡证OCR引擎。请对图片进行结构化识别：\n"
-                "1) 判断卡证类型（身份证/银行卡/驾驶证/护照/工牌/其他）；\n"
-                "2) 以Markdown表格输出关键字段和值；字段示例：姓名、姓名(EN)、性别、民族、生日、住址、公民身份号码、签发机关、有效期限、卡号、有效期、发卡行等；\n"
-                "3) 若有头像或水印信息，请在表格下方以文本补充说明；\n"
-                "4) 保持原图文字内容尽量完整，不要输出围栏代码块。"
+                "你是专业的卡证OCR引擎，请对输入图片进行结构化识别，并仅输出Markdown表格。\n"
+                "\n"
+                "任务要求如下：\n"
+                "\n"
+            "1. 识别卡证类型：只允许从以下类别中选择一种：\n"
+            "   - 身份证 / 银行卡 / 驾驶证 / 护照 / 工牌 / 其他。\n"
+            "   Markdown表格中添加“卡证类型”字段，并用类别选择赋值。\n"
+            "   **重要**：如果识别为银行卡，必须严格遵守第3条银行卡特殊要求！\n"
+            "\n"
+            "2. 输出格式：\n"
+            "   - 以Markdown表格形式输出所有识别出的关键字段及其对应的值。\n"
+            "   - 若字段中包含“卡号”，请确保该字段的值仅包含数字。\n"
+            "   - 不要使用代码块标记符号（例如 ``` ）。\n"
+            "\n"
+            "3. 银行卡特殊要求（必须严格遵守）：\n"
+            "   如果识别的卡证类型是银行卡，必须在Markdown表格的最后额外添加一个字段：\n"
+            "   - 字段名：卡面类型（必须添加，不可省略）。\n"
+            "   - 基于图片库检索到的相似卡证结果，填充“卡面类型”字段。字段值规则如下：\n"
+            "       ① 当出现任何不确定、模糊或不匹配情况时，“卡面类型”字段的值**必须且只能为“其他”**，不得填写相似图片名或其他文本。\n"
+            "       ② 若识别出的“发卡行”字段的值与这些相似卡证文件名中`_`前面的银行名称相同，"
+            "则“卡面类型”字段的值只能从相似卡证文件名中**严格选择一个**，格式为`银行名称_卡面类型`，去掉文件后缀名，如`中国银行_visa卡`。\n"
+            "       ③ 禁止自定义、生成、猜测或编造新的卡面类型值。任何不存在基于图片库检索到的相似卡证文件名的值都视为错误。\n"
+            "   **重要提醒**：银行卡的Markdown表格必须包含“卡面类型”字段，这是强制要求，不能省略！\n"
+            "   - 如果不是银行卡，则不添加“卡面类型”字段。\n"
+            "\n"
+            "4. 输出限制：\n"
+            "   - 最终输出只包含Markdown表格。\n"
+            "   - 禁止输出任何其他文字或解释性内容。\n"
+            "   - 如果是银行卡，表格中必须包含“卡面类型”字段，否则输出不完整。\n"
             )
+
             effective_prompt = (prompt or "").strip() or default_prompt
             result = self.card_api.recognize_card(
                 image,
@@ -523,6 +570,24 @@ class AdvancedQwen3VLApp:
             )
             if not result.get("success"):
                 return f"�?卡证OCR API调用失败: {result.get('error') or '未知错误'}"
+
+            # 在终端输出RAG相似度匹配结果
+            rag_info = result.get("rag_info")
+            if rag_info and rag_info.get("enabled") and rag_info.get("results"):
+                print("\n" + "=" * 60)
+                print("📊 RAG相似度匹配结果")
+                print("=" * 60)
+                print(f"找到 {len(rag_info['results'])} 张相似图片：\n")
+                for i, r in enumerate(rag_info["results"], 1):
+                    filename = r.get("filename", "未知")
+                    similarity = r.get("similarity", 0.0)
+                    print(f"  {i}. {filename}")
+                    print(f"     相似度: {similarity:.4f} ({similarity*100:.2f}%)")
+                print("=" * 60 + "\n")
+            elif rag_info and not rag_info.get("enabled"):
+                print(f"\n⚠️ RAG未启用: {rag_info.get('reason', '未知原因')}\n")
+            else:
+                print("\n⚠️ 未找到相似图片\n")
 
             cleaned = self._sanitize_markdown(result.get("result") or "")
             self.last_ocr_markdown = f"## 卡证OCR识别（API）结果\n\n{cleaned}"
@@ -854,9 +919,9 @@ class AdvancedQwen3VLApp:
 
 
 DEFAULT_TASK_PROMPTS = {
-    "任务问答": "请根据图片完成指定任务，并给出详细的分析与结论。",
+    "任务问答": "请根据图片完成指定任务。",
     "OCR识别": "请识别并提取这张图片中的所有文字内容，并标注语言类型。请确保所有带样式或表格内容使用Markdown表格表示。",
-    "卡证OCR识别": "请进行卡证类识别并以Markdown表格输出关键字段（如姓名、证件号、有效期、卡号等），并在下方补充备注。",
+    "卡证OCR识别": "请进行卡证类识别并以Markdown表格输出关键字段（如姓名、证件号、有效期、卡号等）",
     "票据OCR识别": "请解析发票/小票等票据，输出关键信息和多行项目表格，并在下方给出置信度与可疑项。",
     "协议OCR识别": "请提取合同/协议关键信息（甲乙方、日期、金额、条款等），保留段落与条款编号，并在末尾给出风险提示。",
     "空间分析": "请分析这张图片中的空间关系，包括相对位置、视角、遮挡、深度与距离感，并给出整体布局描述。",
@@ -1688,7 +1753,7 @@ def main():
     atexit.register(_cleanup)
     interface.queue()
     interface.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=None,  # 自动选择可用端口，避免端口占用错误
         share=False,
         debug=True,
