@@ -57,25 +57,55 @@ class AdvancedQwen3VLApp:
         self.field_templates_dir = "card_field_templates"
 
     def _ensure_card_rag_loaded(self):
-        """懒加载卡证RAG图片库（若存在 rag_cards 目录）。"""
+        """懒加载卡证RAG图片库（若存在 rag_cards 目录），支持多种RAG实现方式。"""
         if self.card_rag_ready:
             return
         try:
             if not os.path.isdir(self.card_rag_dir):
                 self.card_rag_ready = True  # 标记为已尝试，避免重复检查
                 return
-            from multimodal_rag import MultiModalDocumentLoader, MultiModalVectorStore
-            loader = MultiModalDocumentLoader()
-            docs = loader.load_images_from_folder(self.card_rag_dir)
-            if not docs:
+            
+            # 优先尝试使用 multimodal_rag 模块
+            try:
+                from multimodal_rag import MultiModalDocumentLoader, MultiModalVectorStore
+                loader = MultiModalDocumentLoader()
+                docs = loader.load_images_from_folder(self.card_rag_dir)
+                if not docs:
+                    self.card_rag_ready = True
+                    return
+                store = MultiModalVectorStore(persist_directory="./multimodal_chroma_card")
+                store.create_vector_store(docs)
+                self.card_rag_store = store
                 self.card_rag_ready = True
+                print("✅ 使用multimodal_rag加载RAG图片库成功")
                 return
-            store = MultiModalVectorStore(persist_directory="./multimodal_chroma_card")
-            store.create_vector_store(docs)
-            self.card_rag_store = store
+            except Exception as e:
+                print(f"⚠️ 使用multimodal_rag加载失败: {e}，尝试使用简化版RAG")
+            
+            # 如果multimodal_rag不可用，尝试使用SimpleRAGStore（从ocr_card_rag_api导入）
+            try:
+                from ocr_card_rag_api import SimpleRAGStore
+                print("使用简化版RAG功能（基于卡面样式特征）...")
+                store = SimpleRAGStore(use_style_features=True)
+                store.load_images_from_folder(self.card_rag_dir)
+                
+                if not store.image_embeddings:
+                    print("⚠️ RAG图片库为空")
+                    self.card_rag_ready = True
+                    return False
+                
+                self.card_rag_store = store
+                self.card_rag_ready = True
+                print(f"✅ 使用简化版RAG加载成功，共 {len(store.image_embeddings)} 张图片")
+                return
+            except Exception as e:
+                print(f"⚠️ 使用简化版RAG加载失败: {e}")
+            
+            # 如果都失败了，标记为已尝试
             self.card_rag_ready = True
-        except Exception:
-            print("加载RAG图片库失败")
+        except Exception as e:
+            print(f"加载RAG图片库失败: {e}")
+            self.card_rag_ready = True
 
     def _ensure_card_api_loaded(self):
         """懒加载卡证OCR API（RAG增强 + Qwen API 客户端）"""
@@ -97,6 +127,126 @@ class AdvancedQwen3VLApp:
             # RAG 初始化失败时忽略，走纯模型路径
             self.card_rag_store = None
             self.card_rag_ready = True
+
+    def _rag_search_card(self, image, top_k: int = 3):
+        """
+        对输入图片进行RAG检索，返回相似图片信息（与ocr_card_rag_api.py中的逻辑一致）
+        
+        Args:
+            image: 输入图片（PIL Image）
+            top_k: 返回最相似的k张图片
+            
+        Returns:
+            相似图片列表，每个元素包含 {filename, similarity, metadata}
+        """
+        if not self.card_rag_store or not hasattr(self.card_rag_store, "image_embeddings"):
+            return []
+            
+        try:
+            # 生成查询图片的嵌入向量
+            # 兼容两种实现：MultiModalVectorStore 使用 .embeddings.embed_image，SimpleRAGStore 直接使用 .embed_image
+            if hasattr(self.card_rag_store, "embeddings") and hasattr(self.card_rag_store.embeddings, "embed_image"):
+                # 使用 MultiModalVectorStore
+                query_emb = self.card_rag_store.embeddings.embed_image(image)
+            elif hasattr(self.card_rag_store, "embed_image"):
+                # 使用 SimpleRAGStore
+                query_emb = self.card_rag_store.embed_image(image)
+            else:
+                print("⚠️ RAG存储不支持embed_image方法")
+                return []
+            
+            # 计算与图片库中所有图片的相似度
+            similarities = []
+            # 如果SimpleRAGStore有compute_similarity方法，使用它（支持样式相似度）
+            use_compute_similarity = hasattr(self.card_rag_store, "compute_similarity")
+            
+            # 确保查询向量的维度
+            query_dim = len(query_emb) if hasattr(query_emb, '__len__') else query_emb.shape[0] if hasattr(query_emb, 'shape') else 0
+            
+            for idx, emb in enumerate(self.card_rag_store.image_embeddings):
+                try:
+                    # 检查维度是否匹配
+                    emb_dim = len(emb) if hasattr(emb, '__len__') else emb.shape[0] if hasattr(emb, 'shape') else 0
+                    
+                    if query_dim != emb_dim:
+                        # 维度不匹配，跳过或使用默认相似度
+                        print(f"⚠️ 特征维度不匹配: 查询向量={query_dim}, 图片库向量={emb_dim}，跳过该图片")
+                        continue
+                    
+                    if use_compute_similarity:
+                        # 使用样式相似度或CLIP相似度（根据SimpleRAGStore的配置）
+                        similarity = self.card_rag_store.compute_similarity(query_emb, emb)
+                    else:
+                        # 使用余弦相似度（MultiModalVectorStore）
+                        dot_product = np.dot(query_emb, emb)
+                        norm_query = np.linalg.norm(query_emb)
+                        norm_emb = np.linalg.norm(emb)
+                        denom = norm_query * norm_emb + 1e-8
+                        similarity = float(dot_product / denom) if denom > 0 else 0.0
+                    similarities.append((similarity, idx))
+                except Exception as e:
+                    # 如果计算相似度时出错，跳过该图片
+                    print(f"⚠️ 计算相似度失败（图片{idx}）: {str(e)}")
+                    continue
+            
+            # 排序并取Top-K
+            similarities.sort(key=lambda x: x[0], reverse=True)
+            top_results = []
+            
+            for sim, idx in similarities[:top_k]:
+                if idx < len(self.card_rag_store.image_metadatas):
+                    meta = self.card_rag_store.image_metadatas[idx]
+                    filename = meta.get("filename") or os.path.basename(meta.get("source", "")) or f"图片{idx+1}"
+                    top_results.append({
+                        "filename": filename,
+                        "similarity": sim,
+                        "metadata": meta
+                    })
+                    
+            return top_results
+            
+        except Exception as e:
+            print(f"⚠️ RAG检索失败: {str(e)}")
+            return []
+
+    def _build_enhanced_prompt_card(self, base_prompt: str, rag_results: list, custom_prompt: str = None):
+        """
+        构建增强后的提示词（包含RAG检索结果，与ocr_card_rag_api.py中的逻辑一致）
+        
+        Args:
+            base_prompt: 基础提示词
+            rag_results: RAG检索结果
+            custom_prompt: 用户自定义提示词
+            
+        Returns:
+            增强后的完整提示词
+        """
+        if custom_prompt:
+            prompt = custom_prompt
+        else:
+            prompt = base_prompt
+            
+        # 如果有RAG检索结果，添加到提示词中
+        if rag_results:
+            rag_context = "\n基于图片库检索到的相似卡证：\n"
+            for rank, result in enumerate(rag_results, 1):
+                filename = result["filename"]
+                similarity = result["similarity"]
+                rag_context += f"- 卡面{rank}: {filename} | 相似度={similarity:.3f}\n"
+            rag_context += "\n"
+            filenames = [result["filename"].split(".")[0] for result in rag_results]
+            banks = [filename.split("_")[0] for filename in filenames]
+            prompt = rag_context + prompt
+            prompt = prompt + (
+                f"6. 如果是银行卡且字段列表包含'卡面类型'，则按照以下规则填充：\n"
+                f"  - 基于图片库检索到的相似卡证结果{filenames}，填充\"卡面类型\"字段。字段值规则如下：\n"
+                f"       -**禁止**自定义、生成、猜测或编造新的卡面类型值。\n"
+                f"       -当出现任何不确定、模糊或不匹配情况时，\"卡面类型\"字段的值**必须且只能为\"其他\"**。\n"
+                f"       -若识别出的\"发卡行\"字段的值存在与{banks}中银行名称相同的情况，"
+                f"则\"卡面类型\"字段的值只能从{filenames}中**严格选择一个**。\n"
+            )
+            
+        return prompt
 
     def load_model(self, progress=gr.Progress()):
         """加载模型"""
@@ -445,9 +595,11 @@ class AdvancedQwen3VLApp:
             return f"❌ OCR识别失败: {str(e)}"
 
     def ocr_card(self, image, prompt: str = None):
-        """卡证OCR识别：身份证/银行卡/驾驶证等结构化提取"""
+        """卡证OCR识别：身份证/银行卡/驾驶证等结构化提取（使用本地模型，流程与API版本一致）"""
         if not self.is_loaded:
             return "❌ 请先加载模型！"
+        
+        # 使用与ocr_card_api相同的默认提示词
         default_prompt = (
             "你是专业的卡证OCR引擎，请对输入图片进行结构化识别，并仅输出Markdown表格。\n"
             "\n"
@@ -455,58 +607,77 @@ class AdvancedQwen3VLApp:
             "\n"
             "1. 识别卡证类型：只允许从以下类别中选择一种：\n"
             "   - 身份证 / 银行卡 / 驾驶证 / 护照 / 工牌 / 其他。\n"
-            "   Markdown表格中添加“卡证类型”字段，并用类别选择赋值。\n"
+            "   Markdown表格中添加\"卡证类型\"字段，并用类别选择赋值。\n"
             "   **重要**：如果识别为银行卡，必须严格遵守第3条银行卡特殊要求！\n"
             "\n"
             "2. 输出格式：\n"
             "   - 以Markdown表格形式输出所有识别出的关键字段及其对应的值。\n"
-            "   - 若字段中包含“卡号”，请确保该字段的值仅包含数字。\n"
+            "   - 若字段中包含\"卡号\"，请确保该字段的值仅包含数字。\n"
             "   - 不要使用代码块标记符号（例如 ``` ）。\n"
             "\n"
             "3. 银行卡特殊要求（必须严格遵守）：\n"
             "   如果识别的卡证类型是银行卡，必须在Markdown表格的最后额外添加一个字段：\n"
             "   - 字段名：卡面类型（必须添加，不可省略）。\n"
-            "   - 字段值规则如下：\n"
-            "     - 若识别出的发卡行名称与相似图片文件名中的银行名称一致，“卡面类型”字段的值只能从找到的相似图片名称（去掉文件后缀名）中选择，禁止自定义卡面类型。若不一致，则“卡面类型”字段的值必须为“其他”。\n"
-            "   **重要提醒**：银行卡的Markdown表格必须包含“卡面类型”字段，这是强制要求，不能省略！\n"
-            "   - 如果不是银行卡，则不添加“卡面类型”字段。\n"
+            "   - 基于图片库检索到的相似卡证结果，填充\"卡面类型\"字段。字段值规则如下：\n"
+            "       ① 当出现任何不确定、模糊或不匹配情况时，\"卡面类型\"字段的值**必须且只能为\"其他\"**，不得填写相似图片名或其他文本。\n"
+            "       ② 若识别出的\"发卡行\"字段的值与这些相似卡证文件名中`_`前面的银行名称相同，"
+            "则\"卡面类型\"字段的值只能从相似卡证文件名中**严格选择一个**，格式为`银行名称_卡面类型`，去掉文件后缀名，如`中国银行_visa卡`。\n"
+            "       ③ 禁止自定义、生成、猜测或编造新的卡面类型值。任何不存在基于图片库检索到的相似卡证文件名的值都视为错误。\n"
+            "   **重要提醒**：银行卡的Markdown表格必须包含\"卡面类型\"字段，这是强制要求，不能省略！\n"
+            "   - 如果不是银行卡，则不添加\"卡面类型\"字段。\n"
             "\n"
             "4. 输出限制：\n"
-            "   - 最终输出只包含Markdown表格及必要的头像/水印说明。\n"
+            "   - 最终输出只包含Markdown表格。\n"
             "   - 禁止输出任何其他文字或解释性内容。\n"
-            "   - 如果是银行卡，表格中必须包含“卡面类型”字段，否则输出不完整。\n"
+            "   - 如果是银行卡，表格中必须包含\"卡面类型\"字段，否则输出不完整。\n"
         )
 
         effective_prompt = (prompt or "").strip() or default_prompt
 
-        # 先尝试进行基于图片库的多模态RAG检索，获取相似卡证参考
-        rag_prefix = ""
+        # RAG检索（使用与API版本相同的逻辑）
+        rag_results = []
         try:
             self._ensure_card_rag_loaded()
             if self.card_rag_store and getattr(self.card_rag_store, "image_embeddings", None):
-                query_emb = self.card_rag_store.embeddings.embed_image(image)
-                sims = []
-                for idx, emb in enumerate(self.card_rag_store.image_embeddings):
-                    # 余弦相似度
-                    denom = (np.linalg.norm(query_emb) * np.linalg.norm(emb) + 1e-8)
-                    sim = float(np.dot(query_emb, emb) / denom) if denom > 0 else 0.0
-                    sims.append((sim, idx))
-                sims.sort(key=lambda x: x[0], reverse=True)
-                topk = sims[:3]
-                if topk:
-                    lines = ["基于图片库检索到的相似卡证（仅作格式/字段参考，勿臆断）："]
-                    for rank, (sim, idx) in enumerate(topk, 1):
-                        meta = self.card_rag_store.image_metadatas[idx] if idx < len(self.card_rag_store.image_metadatas) else {}
-                        fname = meta.get("filename") or os.path.basename(meta.get("source", "")) or f"示例{rank}"
-                        lines.append(f"- 参考{rank}: {fname} | 相似度={sim:.3f}")
-                    rag_prefix = "\n".join(lines) + "\n\n"
-        except Exception:
-            rag_prefix = ""
+                rag_results = self._rag_search_card(image, top_k=3)
+        except Exception as e:
+            print(f"⚠️ RAG检索失败: {str(e)}")
+            rag_results = []
+
+        # 在终端输出RAG相似度匹配结果（与API版本一致）
+        if rag_results:
+            print("\n" + "=" * 60)
+            print("📊 RAG相似度匹配结果")
+            print("=" * 60)
+            print(f"找到 {len(rag_results)} 张相似图片：\n")
+            for i, r in enumerate(rag_results, 1):
+                filename = r.get("filename", "未知")
+                similarity = r.get("similarity", 0.0)
+                print(f"  {i}. {filename}")
+                print(f"     相似度: {similarity:.4f} ({similarity*100:.2f}%)")
+            print("=" * 60 + "\n")
+        else:
+            print("\n⚠️ 未找到相似图片\n")
+
+        # 构建增强提示词（使用与API版本相同的逻辑）
+        enhanced_prompt = self._build_enhanced_prompt_card(
+            base_prompt=default_prompt,
+            rag_results=rag_results,
+            custom_prompt=effective_prompt if (prompt or "").strip() else None
+        )
+
+        # 在终端输出发送给模型的完整prompt（与API版本一致）
+        print("\n" + "=" * 80)
+        print("📝 发送给模型的完整Prompt")
+        print("=" * 80)
+        print(enhanced_prompt)
+        print("=" * 80 + "\n")
 
         try:
+            # 使用本地模型进行推理
             prompt_clean, response, _ = self._run_inference(
                 image,
-                (rag_prefix + effective_prompt) if rag_prefix else effective_prompt,
+                enhanced_prompt,
                 max_tokens=1024,
                 temperature=0.3,
                 top_p=0.8,
