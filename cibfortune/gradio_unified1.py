@@ -37,7 +37,7 @@ class AdvancedQwen3VLApp:
     def __init__(self):
         self.model = None
         self.processor = None
-        self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+        self.model_path = "/home/centrix/Develop/Cibfortune/cibfortune/Qwen3-VL-2B-Instruct"
         self.is_loaded = False
         self.chat_history = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -122,7 +122,7 @@ class AdvancedQwen3VLApp:
         try:
             api = CardOCRWithRAG(
                 api_key=None,
-                model="qwen-vl-plus",
+                model="qwen3-vl-plus",
                 rag_image_dir=self.card_rag_dir,
                 persist_directory="./multimodal_chroma_card",
             )
@@ -263,7 +263,7 @@ class AdvancedQwen3VLApp:
         try:
             api = CardOCRWithRAG(
                 api_key=None,
-                model="qwen-vl-max",  # 票据OCR使用qwen-vl-max模型
+                model="qwen3-vl-plus",  # 票据OCR使用qwen-vl-max模型
                 rag_image_dir=None,  # 票据OCR不使用RAG
                 persist_directory=None,
             )
@@ -619,6 +619,8 @@ class AdvancedQwen3VLApp:
 
     def detect_bill_type(self, image):
         """票据识别第一步：识别票据类型并加载默认字段模板（使用HTML模板）"""
+        supported_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票"]
+
         if image is None:
             return None, [], None, "❌ 请先上传图片"
         
@@ -630,7 +632,8 @@ class AdvancedQwen3VLApp:
             # 票据OCR只识别银行承兑汇票
             type_prompt = (
                 "请识别这张图片中的票据类型。\n"
-                "只允许从以下类别中选择一种：银行承兑汇票。\n"
+                f"只允许从以下类别中选择一种：{supported_bill_type}。\n"
+                "转账支票类型必须有\"转账支票\"关键词，现金支票类型必须有\"现金支票\"关键词，其他支票为普通支票\n"
                 "只输出票据类型，不要输出其他内容。"
             )
             
@@ -647,20 +650,21 @@ class AdvancedQwen3VLApp:
             
             # 从结果中提取票据类型
             result_text = result.get("result", "").strip()
-            bill_types = ["银行承兑汇票"]
             detected_type = None
             
-            for bt in bill_types:
+            for bt in supported_bill_type:
                 if bt in result_text:
                     detected_type = bt
                     break
             
-            if not detected_type:
-                detected_type = "银行承兑汇票"  # 默认使用银行承兑汇票
+            # No need to set default
+            # if not detected_type:
+            #     detected_type = "银行承兑汇票"  # 默认使用银行承兑汇票
             
             # 加载对应的默认字段模板（票据OCR使用HTML模板）
             templates = self._load_field_templates()
-            default_fields = templates.get(detected_type, templates.get("其他", []))
+            #todo: add template of other bills
+            default_fields = templates.get(detected_type, templates.get("其他票据", [])) 
             
             # 获取HTML表格内容（票据OCR必须使用HTML模板）
             html_template = getattr(self, 'field_template_htmls', {}).get(detected_type, None)
@@ -1893,7 +1897,7 @@ class AdvancedQwen3VLApp:
 
             progress(0.7, desc="加载处理器...")
             self.processor = AutoProcessor.from_pretrained(self.model_path)
-
+            print("加载处理器")
             progress(1.0, desc="完成！")
             self.is_loaded = True
 
