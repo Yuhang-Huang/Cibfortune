@@ -619,7 +619,7 @@ class AdvancedQwen3VLApp:
 
     def detect_bill_type(self, image):
         """票据识别第一步：识别票据类型并加载默认字段模板（使用HTML模板）"""
-        supported_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票"]
+        supported_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票", "本票"]
 
         if image is None:
             return None, [], None, "❌ 请先上传图片"
