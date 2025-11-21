@@ -630,7 +630,7 @@ def main():
 
     # 启动服务
     interface.launch(
-        server_name="0.0.0.0",  # 允许外部访问
+        server_name="127.0.0.1",  # 允许外部访问
         server_port=7860,       # 端口
         share=False,            # 不创建公共链接
         debug=True,             # 调试模式

@@ -172,7 +172,7 @@ def main():
         elif choice == "1":
             if check_dependencies() and check_model():
                 try:
-                    from gradio_unified import main as unified_main
+                    from gradio_unified1 import main as unified_main
                     unified_main()
                 except Exception as e:
                     print(f"❌ 启动失败: {e}")

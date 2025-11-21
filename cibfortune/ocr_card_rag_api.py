@@ -89,6 +89,7 @@ class StyleFeatureExtractor:
             img_array = np.array(image.convert('RGB'))
         
         # 1. 颜色直方图特征（HSV色彩空间，更能反映卡面颜色风格）
+        color_feature_size = 150  # 50*3 = 150
         try:
             if self.use_cv2:
                 hsv = self.cv2.cvtColor(img_bgr, self.cv2.COLOR_BGR2HSV)
@@ -117,8 +118,11 @@ class StyleFeatureExtractor:
                 features.extend(hist_b)
         except Exception as e:
             print(f"⚠️ 颜色特征提取失败: {e}")
+            # 使用默认值确保维度一致
+            features.extend([0.0] * color_feature_size)
         
         # 2. 边缘特征（反映卡面边框和布局）
+        edge_feature_size = 9  # 3x3 = 9
         try:
             if self.use_cv2:
                 gray = self.cv2.cvtColor(img_bgr, self.cv2.COLOR_BGR2GRAY)
@@ -150,22 +154,47 @@ class StyleFeatureExtractor:
                 features.extend(edge_densities)
         except Exception as e:
             print(f"⚠️ 边缘特征提取失败: {e}")
+            # 使用默认值确保维度一致
+            features.extend([0.0] * edge_feature_size)
         
         # 3. 主要颜色特征（提取卡面主色调）
         try:
             # 使用K-means提取主要颜色（简化版：直接采样）
-            img_resized = image.resize((100, 100))
-            pixels = np.array(img_resized).reshape(-1, 3)
+            # 确保图片是RGB格式
+            img_rgb = image.convert('RGB')
+            img_resized = img_rgb.resize((100, 100))
+            img_array = np.array(img_resized)
+            
+            # 检查数组形状，确保是 (height, width, 3) 格式
+            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                pixels = img_array.reshape(-1, 3)
+            elif len(img_array.shape) == 2:
+                # 如果是灰度图，转换为RGB
+                pixels = np.stack([img_array, img_array, img_array], axis=-1).reshape(-1, 3)
+            else:
+                # 其他情况，尝试直接使用
+                pixels = img_array.reshape(-1, img_array.shape[-1] if len(img_array.shape) > 2 else 1)
+                if pixels.shape[1] != 3:
+                    # 如果无法转换为3通道，使用默认值
+                    pixels = np.array([[128, 128, 128]] * 10000)  # 使用灰色作为默认值
+            
             # 采样部分像素
             sample_size = min(1000, len(pixels))
             if len(pixels) > sample_size:
                 indices = np.random.choice(len(pixels), sample_size, replace=False)
                 pixels = pixels[indices]
+            
             # 计算主要颜色（RGB均值）
-            main_colors = np.mean(pixels, axis=0)
-            features.extend(main_colors / 255.0)  # 归一化到0-1
+            if pixels.shape[1] == 3:
+                main_colors = np.mean(pixels, axis=0)
+                features.extend(main_colors / 255.0)  # 归一化到0-1
+            else:
+                # 如果维度不对，使用默认值
+                features.extend([0.5, 0.5, 0.5])  # 灰色
         except Exception as e:
             print(f"⚠️ 主色特征提取失败: {e}")
+            # 使用默认值避免特征维度不一致
+            features.extend([0.5, 0.5, 0.5])  # 灰色
         
         # 4. 图像尺寸和宽高比（反映卡面比例）
         w, h = image.size
@@ -539,18 +568,34 @@ class CardOCRWithRAG:
             # 如果SimpleRAGStore有compute_similarity方法，使用它（支持样式相似度）
             use_compute_similarity = hasattr(self.card_rag_store, "compute_similarity")
             
+            # 确保查询向量的维度
+            query_dim = len(query_emb) if hasattr(query_emb, '__len__') else query_emb.shape[0] if hasattr(query_emb, 'shape') else 0
+            
             for idx, emb in enumerate(self.card_rag_store.image_embeddings):
-                if use_compute_similarity:
-                    # 使用样式相似度或CLIP相似度（根据SimpleRAGStore的配置）
-                    similarity = self.card_rag_store.compute_similarity(query_emb, emb)
-                else:
-                    # 使用余弦相似度（MultiModalVectorStore）
-                    dot_product = np.dot(query_emb, emb)
-                    norm_query = np.linalg.norm(query_emb)
-                    norm_emb = np.linalg.norm(emb)
-                    denom = norm_query * norm_emb + 1e-8
-                    similarity = float(dot_product / denom) if denom > 0 else 0.0
-                similarities.append((similarity, idx))
+                try:
+                    # 检查维度是否匹配
+                    emb_dim = len(emb) if hasattr(emb, '__len__') else emb.shape[0] if hasattr(emb, 'shape') else 0
+                    
+                    if query_dim != emb_dim:
+                        # 维度不匹配，跳过或使用默认相似度
+                        print(f"⚠️ 特征维度不匹配: 查询向量={query_dim}, 图片库向量={emb_dim}，跳过该图片")
+                        continue
+                    
+                    if use_compute_similarity:
+                        # 使用样式相似度或CLIP相似度（根据SimpleRAGStore的配置）
+                        similarity = self.card_rag_store.compute_similarity(query_emb, emb)
+                    else:
+                        # 使用余弦相似度（MultiModalVectorStore）
+                        dot_product = np.dot(query_emb, emb)
+                        norm_query = np.linalg.norm(query_emb)
+                        norm_emb = np.linalg.norm(emb)
+                        denom = norm_query * norm_emb + 1e-8
+                        similarity = float(dot_product / denom) if denom > 0 else 0.0
+                    similarities.append((similarity, idx))
+                except Exception as e:
+                    # 如果计算相似度时出错，跳过该图片
+                    print(f"⚠️ 计算相似度失败（图片{idx}）: {str(e)}")
+                    continue
             
             # 排序并取Top-K
             similarities.sort(key=lambda x: x[0], reverse=True)
@@ -623,20 +668,31 @@ class CardOCRWithRAG:
             
         # 如果有RAG检索结果，添加到提示词中
         if rag_results:
-            rag_context = "\n基于图片库检索到的相似卡证（仅作格式/字段参考，勿臆断）：\n"
+            rag_context = "\n基于图片库检索到的相似卡证：\n"
             for rank, result in enumerate(rag_results, 1):
                 filename = result["filename"]
                 similarity = result["similarity"]
-                rag_context += f"- 参考{rank}: {filename} | 相似度={similarity:.3f}\n"
+                rag_context += f"- 卡面{rank}: {filename} | 相似度={similarity:.3f}\n"
             rag_context += "\n"
+            filenames = [result["filename"].split(".")[0] for result in rag_results]
+            banks = [filename.split("_")[0] for filename in filenames]
             prompt = rag_context + prompt
+            prompt = prompt+ (
+                f"6. 如果是银行卡且字段列表包含'卡面类型'，则按照以下规则填充：\n"
+                f"  - 基于图片库检索到的相似卡证结果{filenames}，填充“卡面类型”字段。字段值规则如下：\n"
+                f"       -**禁止**自定义、生成、猜测或编造新的卡面类型值。\n"
+                f"       -当出现任何不确定、模糊或不匹配情况时，“卡面类型”字段的值**必须且只能为“其他”**。\n"
+                f"       -若识别出的“发卡行”字段的值存在与{banks}中银行名称相同的情况，"
+                f"则“卡面类型”字段的值只能从{filenames}中**严格选择一个**。\n"
+
+            )
             
         return prompt
     
     def recognize_card(
         self,
         image: Image.Image,
-        custom_prompt: Optional[str] = None,
+        custom_prompt: Optional[str],
         max_tokens: int = 1024,
         temperature: float = 0.3,
         top_p: float = 0.8,
@@ -673,15 +729,16 @@ class CardOCRWithRAG:
             }
         
         # 默认提示词
-        default_prompt = (
-            "你是专业的卡证OCR引擎。请对图片进行结构化识别：\n"
-            "1) 判断卡证类型（身份证/银行卡/驾驶证/护照/工牌/其他）；\n"
-            "2) 以Markdown表格输出关键字段和值；字段示例：姓名/姓名(EN)、性别、民族、生日、住址、公民身份号码、签发机关、有效期限、卡号、有效期、发卡行等，卡号中只能包含数字；\n"
-            "3) 若有头像或水印信息，请在表格下方以文本补充说明；\n"
-            "4) 保持原图文字内容尽量完整，不要输出围栏代码块；\n"
-            "5) 如果和给定的卡证图片库中的图片相似，请在表格下方给出相似度，并给出相似卡证的图片名称。"
-        )
-        
+        # default_prompt = (
+        #     "你是专业的卡证OCR引擎。请对图片进行结构化识别：\n"
+        #     "1) 判断卡证类型（身份证/银行卡/驾驶证/护照/工牌/其他）；\n"
+        #     "2) 以Markdown表格输出关键字段和值；字段示例：姓名/姓名(EN)、性别、民族、生日、住址、公民身份号码、签发机关、有效期限、卡号、有效期、发卡行等，卡号中只能包含数字；\n"
+        #     "3) 若有头像或水印信息，请在表格下方以文本补充说明；\n"
+        #     "4) 保持原图文字内容尽量完整，不要输出围栏代码块；\n"
+        #     "5) 如果和给定的卡证图片库中的图片相似，请在表格下方给出相似度，并给出相似卡证的图片名称。"
+        # )
+        default_prompt = None
+
         # RAG检索
         rag_results = []
         if use_rag and self.card_rag_store:
@@ -689,13 +746,20 @@ class CardOCRWithRAG:
         
         # 构建增强提示词
         enhanced_prompt = self._build_enhanced_prompt(
-            default_prompt,
+            custom_prompt,
             rag_results,
-            custom_prompt
+            default_prompt
         )
         
         # 将图片转换为base64
         image_base64 = self._image_to_base64(image)
+        
+        # 在终端输出发送给API的完整prompt
+        print("\n" + "=" * 80)
+        print("📝 发送给API的完整Prompt")
+        print("=" * 80)
+        print(enhanced_prompt)
+        print("=" * 80 + "\n")
         
         # 准备Qwen API消息格式（兼容OpenAI格式）
         messages = [
