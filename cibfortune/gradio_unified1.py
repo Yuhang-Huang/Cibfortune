@@ -37,7 +37,11 @@ class AdvancedQwen3VLApp:
     def __init__(self):
         self.model = None
         self.processor = None
+<<<<<<< HEAD
         self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+=======
+        self.model_path = "/home/centrix/Develop/Cibfortune/cibfortune/Qwen3-VL-2B-Instruct"
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
         self.is_loaded = False
         self.chat_history = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -619,6 +623,11 @@ class AdvancedQwen3VLApp:
 
     def detect_bill_type(self, image):
         """票据识别第一步：识别票据类型并加载默认字段模板（使用HTML模板）"""
+<<<<<<< HEAD
+=======
+        supported_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票", "本票", "付款回单", "收款回单"]
+
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
         if image is None:
             return None, [], None, "❌ 请先上传图片"
         
@@ -630,7 +639,12 @@ class AdvancedQwen3VLApp:
             # 票据OCR只识别银行承兑汇票
             type_prompt = (
                 "请识别这张图片中的票据类型。\n"
+<<<<<<< HEAD
                 "只允许从以下类别中选择一种：银行承兑汇票。\n"
+=======
+                f"只允许从以下类别中选择一种：{supported_bill_type}。\n"
+                "转账支票类型必须有\"转账支票\"关键词，现金支票类型必须有\"现金支票\"关键词，其他支票为普通支票\n"
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                 "只输出票据类型，不要输出其他内容。"
             )
             
@@ -647,20 +661,37 @@ class AdvancedQwen3VLApp:
             
             # 从结果中提取票据类型
             result_text = result.get("result", "").strip()
+<<<<<<< HEAD
             bill_types = ["银行承兑汇票"]
             detected_type = None
             
             for bt in bill_types:
+=======
+            detected_type = None
+            
+            for bt in supported_bill_type:
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                 if bt in result_text:
                     detected_type = bt
                     break
             
+<<<<<<< HEAD
             if not detected_type:
                 detected_type = "银行承兑汇票"  # 默认使用银行承兑汇票
             
             # 加载对应的默认字段模板（票据OCR使用HTML模板）
             templates = self._load_field_templates()
             default_fields = templates.get(detected_type, templates.get("其他", []))
+=======
+            # No need to set default
+            # if not detected_type:
+            #     detected_type = "银行承兑汇票"  # 默认使用银行承兑汇票
+            
+            # 加载对应的默认字段模板（票据OCR使用HTML模板）
+            templates = self._load_field_templates()
+            #todo: add template of other bills
+            default_fields = templates.get(detected_type, templates.get("其他票据", [])) 
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
             
             # 获取HTML表格内容（票据OCR必须使用HTML模板）
             html_template = getattr(self, 'field_template_htmls', {}).get(detected_type, None)
@@ -1177,6 +1208,7 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             return f"❌ OCR识别失败: {str(e)}"
 
+<<<<<<< HEAD
     def ocr_bill_with_fields(self, image, fields_to_extract, table_scale: float = 1.0):
         """票据OCR第三步：使用指定字段进行OCR识别（使用HTML模板）
 
@@ -1185,12 +1217,17 @@ class AdvancedQwen3VLApp:
             fields_to_extract: 需要提取的字段列表
             table_scale: 表格缩放倍数（仅影响展示，不影响识别结果），推荐范围 0.5 ~ 2.0
         """
+=======
+    def ocr_bill_with_fields(self, image, fields_to_extract):
+        """票据OCR第三步：使用指定字段进行OCR识别（使用HTML模板）"""
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
         if image is None:
             return "❌ 请先上传图片"
         
         if not fields_to_extract:
             return "❌ 请先设置要提取的字段"
         
+<<<<<<< HEAD
         # 规范化缩放倍数，避免异常值
         try:
             table_scale = float(table_scale)
@@ -1198,6 +1235,8 @@ class AdvancedQwen3VLApp:
             table_scale = 1.0
         table_scale = max(0.5, min(table_scale, 2.0))
 
+=======
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
         try:
             self._ensure_bill_api_loaded()
             if self.bill_api is None:
@@ -1287,6 +1326,7 @@ class AdvancedQwen3VLApp:
                     soup = BeautifulSoup(raw_result, 'html.parser')
                     table = soup.find('table')
                     if table:
+<<<<<<< HEAD
                         # 在表格本身增加缩放（通过 CSS transform 实现，对表格整体缩放）
                         existing_style = table.get('style', '')
                         scale_style = f"transform: scale({table_scale}); transform-origin: top left;"
@@ -1295,6 +1335,8 @@ class AdvancedQwen3VLApp:
                         else:
                             table['style'] = scale_style
 
+=======
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                         # 添加样式使表格更美观且可编辑
                         table['class'] = (table.get('class', []) or []) + ['ocr-result-table']
                         # 获取所有字段名（用于识别哪些单元格是字段名，哪些是值）
@@ -1308,28 +1350,45 @@ class AdvancedQwen3VLApp:
                             elif not cell_text:
                                 td['contenteditable'] = 'true'
                         
+<<<<<<< HEAD
                         # 优化的表格样式：表格本身支持调整大小
                         # 添加JavaScript代码，监听编辑事件并更新隐藏的Textbox
                         styled_html = f"""
                         <style>
                         /* 表格本身支持调整大小 - 使用容器查询实现纯CSS缩放 */
                         .ocr-result-table-wrapper {{
+=======
+                        # 优化的表格样式：可调整大小的容器，表格随容器大小变化
+                        # 添加JavaScript代码，监听编辑事件并更新隐藏的Textbox
+                        styled_html = f"""
+                        <style>
+                        /* 可调整大小的表格容器 */
+                        .ocr-result-table-container {{
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                             position: relative;
                             display: inline-block;
                             min-width: 500px;
                             min-height: 300px;
                             max-width: 95vw;
                             max-height: 90vh;
+<<<<<<< HEAD
                             width: 600px;
                             height: 400px;
                             resize: both;
                             overflow: auto;
+=======
+                            width: 100%;
+                            height: 600px;
+                            resize: both;
+                            overflow: auto;  /* 允许滚动，确保表格不超出容器 */
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                             border: 2px solid #e0e0e0;
                             border-radius: 8px;
                             padding: 10px;
                             background-color: #f8f9fa;
                             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
                             margin: 20px 0;
+<<<<<<< HEAD
                             /* 启用容器查询 */
                             container-type: size;
                             container-name: table-container;
@@ -1419,14 +1478,24 @@ class AdvancedQwen3VLApp:
                         }}
                         /* 调整大小手柄样式 */
                         .ocr-result-table-wrapper::-webkit-resizer {{
+=======
+                        }}
+                        /* 调整大小手柄样式 */
+                        .ocr-result-table-container::-webkit-resizer {{
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                             border-radius: 0 0 8px 0;
                             width: 20px;
                             height: 20px;
                         }}
                         /* 调整大小提示 */
+<<<<<<< HEAD
                         .ocr-result-table-wrapper::before {{
                             content: '↘ 拖拽调整表格大小';
+=======
+                        .ocr-result-table-container::before {{
+                            content: '↘ 拖拽调整大小';
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                             position: absolute;
                             top: 5px;
                             right: 5px;
@@ -1440,6 +1509,7 @@ class AdvancedQwen3VLApp:
                             z-index: 5;
                             transition: opacity 0.3s ease;
                         }}
+<<<<<<< HEAD
                         .ocr-result-table-wrapper:hover::before {{
                             opacity: 1;
                         }}
@@ -1452,11 +1522,42 @@ class AdvancedQwen3VLApp:
                         .ocr-result-table td {{
                             border: 1px solid #e0e0e0;
                             padding: 10px 14px;
+=======
+                        .ocr-result-table-container:hover::before {{
+                            opacity: 1;
+                        }}
+                        /* 调整大小时的边框高亮 */
+                        .ocr-result-table-container:active {{
+                            border-color: #667eea;
+                            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+                        }}
+                        .ocr-result-table {{
+                            width: auto;  /* 表格宽度根据内容自适应 */
+                            min-width: 100%;  /* 最小宽度为容器宽度 */
+                            max-width: 100%;  /* 最大宽度不超过容器 */
+                            border-collapse: collapse;
+                            margin: 0;
+                            font-size: 14px;
+                            table-layout: auto;  /* 使用auto，让列宽根据内容自动调整 */
+                            box-shadow: none;
+                            border-radius: 8px;
+                            overflow: visible;  /* 允许内容溢出，不裁剪 */
+                            background-color: #ffffff;
+                        }}
+                        .ocr-result-table th,
+                        .ocr-result-table td {{
+                            border: 1px solid #e0e0e0;
+                            padding: 12px 16px;
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                             text-align: left;
                             vertical-align: top;
                             word-break: break-word;
                             word-wrap: break-word;
+<<<<<<< HEAD
                             transition: font-size 0.1s ease-out, padding 0.1s ease-out, border-width 0.1s ease-out;
+=======
+                            transition: all 0.2s ease;
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                             line-height: 1.6;
                             height: auto !important;  /* 行高根据内容自动调整，覆盖HTML中的固定height */
                             min-height: auto !important;
@@ -1560,7 +1661,11 @@ class AdvancedQwen3VLApp:
                         }}
                         /* 响应式设计 */
                         @media (max-width: 768px) {{
+<<<<<<< HEAD
                             .ocr-result-table-wrapper {{
+=======
+                            .ocr-result-table-container {{
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                                 min-width: 300px;
                                 min-height: 200px;
                             }}
@@ -1581,7 +1686,117 @@ class AdvancedQwen3VLApp:
                             }}
                         }}
                         </style>
+<<<<<<< HEAD
                         <div class="ocr-result-table-wrapper">
+=======
+                        <script>
+                        (function() {{
+                            // 移除所有固定的height和width属性，让行高和列宽根据内容自动调整
+                            function removeFixedHeights() {{
+                                var table = document.querySelector('.ocr-result-table');
+                                if (table) {{
+                                    // 移除table的width属性
+                                    if (table.hasAttribute('width')) {{
+                                        table.removeAttribute('width');
+                                    }}
+                                    if (table.style.width) {{
+                                        table.style.width = '';
+                                    }}
+                                    
+                                    // 移除tr的height和width属性
+                                    var rows = table.querySelectorAll('tr');
+                                    rows.forEach(function(row) {{
+                                        if (row.hasAttribute('height')) {{
+                                            row.removeAttribute('height');
+                                        }}
+                                        if (row.hasAttribute('width')) {{
+                                            row.removeAttribute('width');
+                                        }}
+                                    }});
+                                    
+                                    // 移除td和th的height和width属性
+                                    var cells = table.querySelectorAll('td, th');
+                                    cells.forEach(function(cell) {{
+                                        if (cell.hasAttribute('height')) {{
+                                            cell.removeAttribute('height');
+                                        }}
+                                        if (cell.hasAttribute('width')) {{
+                                            cell.removeAttribute('width');
+                                        }}
+                                        // 移除内联样式中的height和width
+                                        if (cell.style.height) {{
+                                            cell.style.height = '';
+                                        }}
+                                        if (cell.style.width) {{
+                                            cell.style.width = '';
+                                        }}
+                                    }});
+                                    
+                                    // 移除colgroup中的width属性
+                                    var colgroups = table.querySelectorAll('colgroup');
+                                    colgroups.forEach(function(colgroup) {{
+                                        var cols = colgroup.querySelectorAll('col');
+                                        cols.forEach(function(col) {{
+                                            if (col.hasAttribute('width')) {{
+                                                col.removeAttribute('width');
+                                            }}
+                                            if (col.style.width) {{
+                                                col.style.width = '';
+                                            }}
+                                        }});
+                                    }});
+                                }}
+                            }}
+                            
+                            // 根据文本长度动态设置data-length属性
+                            function updateCellLength() {{
+                                var cells = document.querySelectorAll('.ocr-result-table td[contenteditable="true"]');
+                                cells.forEach(function(cell) {{
+                                    var text = cell.textContent || cell.innerText || '';
+                                    var length = text.length;
+                                    cell.removeAttribute('data-length');
+                                    if (length > 0) {{
+                                        if (length <= 20) {{
+                                            cell.setAttribute('data-length', 'short');
+                                        }} else if (length <= 50) {{
+                                            cell.setAttribute('data-length', 'medium');
+                                        }} else if (length <= 100) {{
+                                            cell.setAttribute('data-length', 'long');
+                                        }} else {{
+                                            cell.setAttribute('data-length', 'very-long');
+                                        }}
+                                    }}
+                                }});
+                            }}
+                            
+                            // 页面加载后执行
+                            setTimeout(function() {{
+                                removeFixedHeights();
+                                updateCellLength();
+                            }}, 100);
+                            
+                            // 监听内容变化
+                            var observer = new MutationObserver(function(mutations) {{
+                                removeFixedHeights();
+                                updateCellLength();
+                            }});
+                            
+                            setTimeout(function() {{
+                                var table = document.querySelector('.ocr-result-table');
+                                if (table) {{
+                                    observer.observe(table, {{
+                                        childList: true,
+                                        subtree: true,
+                                        characterData: true,
+                                        attributes: true,
+                                        attributeFilter: ['height', 'style']
+                                    }});
+                                }}
+                            }}, 200);
+                        }})();
+                        </script>
+                        <div class="ocr-result-table-container">
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                             {str(table)}
                         </div>
                         <script>
@@ -1604,8 +1819,14 @@ class AdvancedQwen3VLApp:
                                     var htmlContent = '';
                                     
                                     if (fullHtml) {{
+<<<<<<< HEAD
                                         // 直接获取表格的outerHTML
                                         htmlContent = table.outerHTML;
+=======
+                                        // 获取包含表格的完整HTML
+                                        var container = fullHtml.querySelector('.ocr-result-table') || fullHtml;
+                                        htmlContent = container.innerHTML;
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                                     }} else {{
                                         // 如果没有找到容器，直接获取表格的outerHTML
                                         htmlContent = table.outerHTML;
@@ -1880,7 +2101,11 @@ class AdvancedQwen3VLApp:
 
             progress(0.7, desc="加载处理器...")
             self.processor = AutoProcessor.from_pretrained(self.model_path)
+<<<<<<< HEAD
 
+=======
+            print("加载处理器")
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
             progress(1.0, desc="完成！")
             self.is_loaded = True
 
@@ -4395,7 +4620,11 @@ def create_unified_interface():
                 outputs=[ocr_export_status_3step]
             )
 
+<<<<<<< HEAD
         with gr.Tab("📄 票据OCR（三步流程）"):
+=======
+        with gr.Tab("📄 单据OCR（三步流程）"):
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
             gr.Markdown("### 三步流程：识别类型 → 自定义字段 → OCR识别（使用HTML表格模板）")
             
             with gr.Row():
@@ -4472,6 +4701,7 @@ def create_unified_interface():
                             )
                         bill_ocr_export_btn_3step = gr.Button("💾 导出结果", variant="secondary", visible=False, size="sm", elem_id="bill-ocr-export-btn")
                     
+<<<<<<< HEAD
                     # 表格缩放控制（仅影响展示，不影响识别结果）
                     bill_table_scale = gr.Slider(
                         minimum=0.5,
@@ -4482,6 +4712,8 @@ def create_unified_interface():
                         visible=True
                     )
                     
+=======
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                     # HTML表格展示（票据OCR使用HTML模板）
                     bill_ocr_result_html = gr.HTML(
                         label="OCR识别结果（HTML表格）",
@@ -4743,7 +4975,11 @@ def create_unified_interface():
                     )
             
             # 第三步：OCR识别
+<<<<<<< HEAD
             def bill_step3_ocr(image, table_scale):
+=======
+            def bill_step3_ocr(image):
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                 if image is None:
                     return (
                         gr.update(visible=False),
@@ -4766,8 +5002,12 @@ def create_unified_interface():
                         gr.update(visible=False)
                     )
                 
+<<<<<<< HEAD
                 # 将表格缩放倍数传递给OCR函数，仅影响展示的表格大小
                 result = app.ocr_bill_with_fields(image, fields_list, table_scale)
+=======
+                result = app.ocr_bill_with_fields(image, fields_list)
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                 
                 html_template = getattr(app, 'current_field_template_html', None)
                 has_html_template = html_template is not None and html_template.strip()
@@ -5046,7 +5286,11 @@ def create_unified_interface():
             
             bill_ocr_with_fields_btn.click(
                 bill_step3_ocr,
+<<<<<<< HEAD
                 inputs=[bill_image, bill_table_scale],
+=======
+                inputs=[bill_image],
+>>>>>>> 47d7aec33f768a7c25e1d974c0075cd1dd4c0bfe
                 outputs=[bill_ocr_result_html, bill_ocr_result_html_edited, bill_ocr_export_format, bill_ocr_export_btn_3step, bill_ocr_export_status_3step]
             )
             

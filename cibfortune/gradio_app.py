@@ -27,6 +27,7 @@ class Qwen3VLGradioApp:
         self.model = None
         self.processor = None
         self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+        self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
         self.is_loaded = False
         self.chat_history = []
         self.chat_messages = []
@@ -63,6 +64,8 @@ class Qwen3VLGradioApp:
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_path,
                 dtype="auto",
+                device_map="cuda",
+                load_in_4bit=True,
                 device_map="cuda",
                 load_in_4bit=True,
             )
@@ -630,6 +633,7 @@ def main():
 
     # 启动服务
     interface.launch(
+        server_name="127.0.0.1",  # 允许外部访问
         server_name="127.0.0.1",  # 允许外部访问
         server_port=7860,       # 端口
         share=False,            # 不创建公共链接
