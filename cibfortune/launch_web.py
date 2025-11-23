@@ -74,7 +74,7 @@ def install_missing_deps():
 
 def check_model():
     """检查模型"""
-    model_path = "/home/centrix/Develop/Cibfortune/cibfortune/Qwen3-VL-2B-Instruct"
+    model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
     
     
     print(f"🔍 检查模型路径: {model_path}")
