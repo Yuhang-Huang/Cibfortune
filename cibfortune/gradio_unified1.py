@@ -263,7 +263,8 @@ class AdvancedQwen3VLApp:
         try:
             api = CardOCRWithRAG(
                 api_key=None,
-                model="qwen3-vl-plus",  # 票据OCR使用qwen-vl-max模型
+                # model="qwen3-vl-plus",
+                model="qwen-vl-max", # 都试试
                 rag_image_dir=None,  # 票据OCR不使用RAG
                 persist_directory=None,
             )
@@ -619,7 +620,7 @@ class AdvancedQwen3VLApp:
 
     def detect_bill_type(self, image):
         """票据识别第一步：识别票据类型并加载默认字段模板（使用HTML模板）"""
-        fixed_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票", "本票", "付款回单", "收款回单", "代发业务回单", ]
+        fixed_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票", "本票", "付款回单", "收款回单", "代发业务回单", "电子发票（铁路电子客票）",]
         extendable_bill_type = ["代发业务清单", "单位活期明细对账单", "电子发票（增值税专用发票）", "电子发票（普通发票）" ]
 
         supported_bill_type = fixed_bill_type + extendable_bill_type
