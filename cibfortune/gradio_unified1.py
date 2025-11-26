@@ -63,6 +63,7 @@ class AdvancedQwen3VLApp:
         self.current_custom_fields = []
         self.current_field_template_html = None  # 存储HTML表格结构
         self.current_final_fields_html = None  # 存储最终字段列表的HTML（包含自定义字段）
+        self.current_parsed_dict = None
 
     def _ensure_card_rag_loaded(self):
         """懒加载卡证RAG图片库（若存在 rag_cards 目录），支持多种RAG实现方式。"""
@@ -300,7 +301,7 @@ class AdvancedQwen3VLApp:
                     return []
                 
                 # 子字段列表（需要与父类别组合）
-                sub_fields = ['全称', '账号', '开户银行', '开户行行号', '开户行名称', '出票人', '承兑人']
+                sub_fields = ['名称', '统一社会信用代码/纳税人识别号', '全称', '账号', '开户银行', '开户行行号', '开户行名称', '出票人', '承兑人']
                 
                 # 用于跟踪每个列位置的活跃rowspan类别
                 # 格式: {列位置: {'name': '类别名', 'remaining_rows': 剩余行数}}
@@ -377,7 +378,7 @@ class AdvancedQwen3VLApp:
                             
                             if parent_category:
                                 # 组合字段名：父类别 + 子字段
-                                full_field = f"{parent_category}{text}"
+                                full_field = f"{parent_category}_{text}"
                                 if full_field not in fields:
                                     fields.append(full_field)
                             else:
@@ -621,7 +622,7 @@ class AdvancedQwen3VLApp:
     def detect_bill_type(self, image):
         """票据识别第一步：识别票据类型并加载默认字段模板（使用HTML模板）"""
         fixed_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票", "本票", "付款回单", "收款回单", "代发业务回单", "电子发票（铁路电子客票）",]
-        extendable_bill_type = ["代发业务清单", "单位活期明细对账单", "电子发票（增值税专用发票）", "电子发票（普通发票）" ]
+        extendable_bill_type = ["代发业务清单", "单位活期明细对账单", "电子发票（增值税专用发票）", "电子发票（普通发票）", "中央非税收入统一票据" ]
 
         supported_bill_type = fixed_bill_type + extendable_bill_type
         if image is None:
@@ -677,6 +678,7 @@ class AdvancedQwen3VLApp:
             self.current_default_fields = default_fields.copy()
             self.current_custom_fields = []
             self.current_field_template_html = html_template
+            self.current_parsed_dict = None # 清除过去解析结果
             
             return detected_type, default_fields, html_template, f"✅ 识别成功：{detected_type}"
             
@@ -1199,7 +1201,7 @@ class AdvancedQwen3VLApp:
             
             # 构建包含字段列表的提示词
             fields_list = "、".join(fields_to_extract)
-            
+
             # 票据OCR使用HTML模板
             html_template = getattr(self, 'current_final_fields_html', None)
             if not html_template:
@@ -1224,12 +1226,15 @@ class AdvancedQwen3VLApp:
                     f"- 如果图片中没有某个字段的值，该字段的值必须填写'无'，但不能跳过该字段\n"
                     f"- 请仔细检查图片中的每一个位置，确保所有字段都被识别和填充\n"
                     f"- 对于组合字段（如'出票人全称'、'出票人账号'等），需要分别识别每个子字段\n"
+                    f"- 对于小写金额类型字段，如果为表格形式，需要**仔细核对每一位数字对应的单位**，**必须保证大小写数值相一致**"
+                    f"- HTML表格中的小写金额字段**不允许直接用识别结果填充**，**必须用核对过的小写数字填充**，填充内容只能包括**数字和小数点**\n"
                     f"\n"
                     f"【HTML表格模板】\n"
                     f"{html_template}\n"
                     f"\n"
                     f"【输出要求】\n"
                     f"- 只返回填充后的HTML表格（保持原有结构、行列、合并单元格和样式/属性），不要返回任何其他说明文字\n"
+                    #f"- 返回填充后的HTML表格（保持原有结构、行列、合并单元格和样式/属性），需要返回解释说明文字\n"
                     f"- 如果HTML表格中存在<repeat>标签，则该标签中包含的内容为表格中某一行的格式，该行可能重复若干次，需要根据识别结果准确判断重复行数并正确填充\n"
                     f"- 不新增或删除字段，不改变表头文案；未识别到的填写'无'\n"
                     f"- 仅在需要填写值的单元格写入文本，避免修改字段名单元格\n"
@@ -1237,6 +1242,10 @@ class AdvancedQwen3VLApp:
                     f"- 禁止输出未在字段列表中的字段和字段值\n"
                     f"- 不要使用代码块标记符号（例如 ``` ）\n"
                 )
+
+                # custom_prompt = (
+                #     f"你是专业的票据OCR引擎。请仔细阅读并识别输入图片中的所有内容，并生成一个对应的json识别结果，需要包含解释信息。\n"
+                # )
             else:
                 # 如果没有HTML模板，使用Markdown表格格式（不应该发生，但作为兜底）
                 custom_prompt = (
@@ -1274,7 +1283,6 @@ class AdvancedQwen3VLApp:
                 return f"❌ OCR识别失败: {result.get('error', '未知错误')}"
             
             raw_result = (result.get("result") or "").strip()
-            
             # 如果模型按要求直接返回HTML表格，则优先使用HTML（注入可编辑样式）
             if has_html_template and "<table" in raw_result.lower():
                 try:
@@ -1877,6 +1885,33 @@ class AdvancedQwen3VLApp:
             
         except Exception as e:
             return f"❌ OCR识别失败: {str(e)}"
+
+    def get_dict_from_html(self, html_content):
+        import ast
+        if not self.current_parsed_dict:
+            prompts = (
+                f"根据所给的html表格，生成一个python字典，使用嵌套字典体现表格中的层次关系\n"
+                f"【输出要求】\n"
+                f"- 只返回填充后的字典，不要返回任何其他说明文字\n"
+                f"- 不新增或删除字段，不改变表头文案；多值对应同一个键则使用列表\n"
+                f"- 禁止输出任何猜测或编造的内容\n"
+                f"- 不要使用代码块标记符号（例如 ``` ）\n"
+                f"{html_content}\n"
+            )
+            
+            try:
+                self._ensure_card_api_loaded()
+                if self.card_api is None:
+                    return "❌ 卡证OCR API未初始化"
+            except:
+                print("导出失败")
+
+            res = self.card_api.general_prompt(prompts)
+            print(res.get("result"))
+            self.current_parsed_dict = ast.literal_eval(res.get("result"))
+        
+        return self.current_parsed_dict
+
 
     def load_model(self, progress=gr.Progress()):
         """加载模型"""
@@ -4435,6 +4470,12 @@ def create_unified_interface():
                         interactive=False,
                         visible=False
                     )
+
+                    bill_field_list = gr.Textbox(
+                        label="字段列表",
+                        interactive=False,
+                        visible=False
+                    )
                     
                     bill_default_fields_title = gr.Markdown("### 📋 默认字段模板", visible=False)
                     # HTML表格展示（票据OCR使用HTML模板）
@@ -4486,8 +4527,8 @@ def create_unified_interface():
                         gr.Markdown("### 📊 OCR识别结果")
                         with gr.Column(scale=1, min_width=200):
                             bill_ocr_export_format = gr.Dropdown(
-                                choices=["Markdown (.md)", "Excel (.xlsx)", "CSV (.csv)", "JSON (.json)"],
-                                value="Markdown (.md)",
+                                choices=["HTML (.html)", "Markdown (.md)", "Excel (.xlsx)", "CSV (.csv)", "JSON (.json)"],
+                                value="HTML (.html)",
                                 label="导出格式",
                                 visible=False
                             )
@@ -4571,7 +4612,8 @@ def create_unified_interface():
                             gr.update(visible=True),
                             gr.update(visible=True),
                             gr.update(visible=True),
-                            gr.update(value=status_msg, visible=True)
+                            gr.update(value=status_msg, visible=True),
+                            default_fields
                         )
                     else:
                         return (
@@ -4582,7 +4624,8 @@ def create_unified_interface():
                             gr.update(visible=True),
                             gr.update(visible=True),
                             gr.update(visible=True),
-                            gr.update(value=status_msg, visible=True)
+                            gr.update(value=status_msg, visible=True),
+                            default_fields
                         )
                 else:
                     return (
@@ -4593,7 +4636,8 @@ def create_unified_interface():
                         gr.update(visible=False),
                         gr.update(visible=False),
                         gr.update(visible=False),
-                        gr.update(value=status_msg, visible=True)
+                        gr.update(value=status_msg, visible=True),
+                        None
                     )
             
             # 第二步：合并字段（票据OCR使用HTML模板）
@@ -4802,7 +4846,10 @@ def create_unified_interface():
                     )
             
             # 导出票据OCR结果
-            def bill_export_ocr_result_3step(html_content, export_format):
+            def bill_export_ocr_result_3step(html_content, export_format, field_list):
+                print("[DEBUG] bill_export_ocr_result_3step called")
+                # print("[DEBUG] html content:" + html_content)
+                # print("[DEBUG] export format:" + export_format)
                 if not html_content or not html_content.strip():
                     return gr.update(visible=True, value="❌ 没有可保存的OCR结果，请先执行OCR识别！")
                 
@@ -4818,6 +4865,81 @@ def create_unified_interface():
                 os.makedirs(export_dir, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 
+                html_export_template = f"""
+                <!DOCTYPE html>
+                <html lang="zh-CN">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>OCR 识别结果预览</title>
+                    <style>
+                        body {{
+                            font-family: "Microsoft YaHei", Arial, sans-serif;
+                            padding: 40px;
+                            background-color: #f4f4f4;
+                            display: flex;
+                            justify-content: center;
+                        }}
+                        
+                        /* 表格容器样式 */
+                        .table-container {{
+                            background-color: white;
+                            padding: 20px;
+                            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                            border-radius: 8px;
+                            overflow-x: auto; /* 防止表格过宽溢出 */
+                        }}
+
+                        /* 核心表格样式 */
+                        table.ocr-result-table {{
+                            border-collapse: collapse; /* 合并边框，必须有 */
+                            margin: 0 auto;
+                            /* 如果你想覆盖原始的 width，可以在这里加 !important，否则保留原始宽度 */
+                        }}
+
+                        /* 单元格样式 */
+                        table.ocr-result-table td, table.ocr-result-table th {{
+                            border: 1px solid #333; /* 实线边框 */
+                            padding: 8px 12px;
+                            text-align: center;
+                            vertical-align: middle;
+                            font-size: 14px;
+                            min-width: 60px; /* 最小宽度防止太挤 */
+                        }}
+
+                        /* 针对可编辑区域 (contenteditable="true") 的样式优化 */
+                        [contenteditable="true"] {{
+                            background-color: #eef7ff; /*以此颜色标识可编辑区域 */
+                            color: #0056b3;
+                            cursor: text;
+                            transition: background-color 0.2s;
+                        }}
+
+                        [contenteditable="true"]:focus {{
+                            background-color: #fff;
+                            outline: 2px solid #2196F3; /* 聚焦时的高亮边框 */
+                            box-shadow: 0 0 5px rgba(33, 150, 243, 0.5);
+                        }}
+                        
+                        /* 表头/标签列的样式 (不可编辑部分) */
+                        td:not([contenteditable="true"]) {{
+                            background-color: #fafafa;
+                            font-weight: bold;
+                            color: #555;
+                        }}
+                    </style>
+                </head>
+                <body>
+
+                    <div class="table-container">
+                        <h3>OCR 导出预览</h3>
+                        {html_content}
+                    </div>
+
+                </body>
+                </html>
+                """
+
                 try:
                     from bs4 import BeautifulSoup
                     # 解析HTML内容，提取表格数据
@@ -4961,6 +5083,8 @@ def create_unified_interface():
                         if not table_data:
                             return gr.update(visible=True, value="❌ 表格数据为空，无法导出！请检查表格格式。")
                     
+                    res = app.get_dict_from_html(html_content)
+
                     if export_format == "Markdown (.md)":
                         markdown_lines = ["## 票据OCR识别结果\n\n| 字段名 | 字段值 |"]
                         markdown_lines.append("|--------|--------|")
@@ -4979,15 +5103,64 @@ def create_unified_interface():
                         return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Markdown文件已保存到:\n{abs_file_path}")
                     elif export_format == "Excel (.xlsx)":
                         import pandas as pd
-                        df = pd.DataFrame(table_data, columns=["字段名", "字段值"])
-                        file_name = f"bill_ocr_{timestamp}.xlsx"
-                        file_path = os.path.join(export_dir, file_name)
-                        df.to_excel(file_path, index=False)
-                        abs_file_path = os.path.abspath(file_path)
-                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Excel文件已保存到:\n{abs_file_path}")
+                        from pandas.io.html import read_html
+                        import openpyxl
+
+                        try:
+                            # 读取HTML表格
+                            tables = read_html(html_content)
+                            
+                            if not tables:
+                                print("未找到HTML表格")
+                                return
+                            
+                            print(f"找到 {len(tables)} 个表格")
+                            file_name = f"bill_ocr_{timestamp}.xlsx"
+                            file_path = os.path.join(export_dir, file_name)
+                            sheet_name = "Sheet1"
+                            # 创建Excel写入器
+                            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                                for i, table in enumerate(tables):
+                                    # 如果有多个表格，使用不同的工作表
+                                    current_sheet = f"{sheet_name}_{i+1}" if len(tables) > 1 else sheet_name
+                                    
+                                    # 将DataFrame写入Excel，保持索引和表头
+                                    table.to_excel(
+                                        writer, 
+                                        sheet_name=current_sheet, 
+                                        index=False,  # 不包含行索引
+                                        header=True   # 包含列标题
+                                    )
+                                    
+                                    # 获取工作表对象进行格式调整
+                                    worksheet = writer.sheets[current_sheet]
+                                    
+                                    # 自动调整列宽
+                                    for column in worksheet.columns:
+                                        max_length = 0
+                                        column_letter = column[0].column_letter
+                                        for cell in column:
+                                            try:
+                                                if len(str(cell.value)) > max_length:
+                                                    max_length = len(str(cell.value))
+                                            except:
+                                                pass
+                                        adjusted_width = min(max_length + 2, 50)  # 限制最大宽度
+                                        worksheet.column_dimensions[column_letter].width = adjusted_width
+                            
+                            print(f"Excel文件已保存: {file_name}")
+                            abs_file_path = os.path.abspath(file_path)
+                            return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Excel文件已保存到:\n{abs_file_path}")
+                        except Exception as e:
+                            print(f"转换过程中出现错误: {e}")
+
+                        # df = pd.json_normalize(table_data, columns=["字段名", "字段值"])
+
+                        # df.to_excel(file_path, index=False)
+
                     elif export_format == "CSV (.csv)":
                         import pandas as pd
-                        df = pd.DataFrame(table_data, columns=["字段名", "字段值"])
+                        df = pd.DataFrame(res.values())
                         file_name = f"bill_ocr_{timestamp}.csv"
                         file_path = os.path.join(export_dir, file_name)
                         df.to_csv(file_path, index=False, encoding='utf-8-sig')
@@ -4995,13 +5168,19 @@ def create_unified_interface():
                         return gr.update(visible=True, value=f"✅ 导出成功！\n📄 CSV文件已保存到:\n{abs_file_path}")
                     elif export_format == "JSON (.json)":
                         import json
-                        data = {field: value for field, value in table_data}
                         file_name = f"bill_ocr_{timestamp}.json"
                         file_path = os.path.join(export_dir, file_name)
                         with open(file_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
+                            json.dump(res, f, ensure_ascii=False, indent=2)
                         abs_file_path = os.path.abspath(file_path)
                         return gr.update(visible=True, value=f"✅ 导出成功！\n📄 JSON文件已保存到:\n{abs_file_path}")
+                    elif export_format == "HTML (.html)":
+                        file_name = f"bill_ocr_{timestamp}.html"
+                        file_path = os.path.join(export_dir, file_name)
+                        with open(file_name, "w", encoding="utf-8") as f:
+                            f.write(html_export_template)
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 HTML文件已保存到:\n{abs_file_path}")
                     else:
                         return gr.update(visible=True, value=f"❌ 不支持的导出格式: {export_format}")
                 except Exception as e:
@@ -5010,13 +5189,14 @@ def create_unified_interface():
                     print(error_msg)
                     return gr.update(visible=True, value=f"❌ 导出失败: {str(e)}")
             
+
             # 绑定事件
             detect_bill_type_btn.click(
                 bill_step1_detect_type,
                 inputs=[bill_image],
                 outputs=[bill_type_output, bill_default_fields_html, bill_default_fields_title, 
                         bill_custom_fields_input, bill_custom_fields_title, bill_add_custom_field_btn,
-                        bill_update_fields_btn, bill_fields_status]
+                        bill_update_fields_btn, bill_fields_status, bill_field_list]
             )
             
             def bill_add_custom_field(current_data):
@@ -5073,11 +5253,12 @@ def create_unified_interface():
             )
             
             # 导出函数：使用JavaScript更新隐藏的Textbox，然后从Textbox读取
-            def export_with_js_content(html_edited, export_format):
+            def export_with_js_content(html_edited, export_format, field_list):
                 """导出函数：使用JavaScript更新后的内容"""
                 print(f"[DEBUG] export_with_js_content接收到内容:")
                 print(f"  - html_edited类型: {type(html_edited)}")
                 print(f"  - html_edited长度: {len(html_edited) if html_edited else 0}")
+                #print(field_list)
                 if html_edited:
                     print(f"  - html_edited预览: {html_edited[:200]}...")
                 
@@ -5085,7 +5266,7 @@ def create_unified_interface():
                     return gr.update(visible=True, value="❌ 没有可保存的OCR结果，请先执行OCR识别！")
                 
                 # 调用导出函数
-                return bill_export_ocr_result_3step(html_edited, export_format)
+                return bill_export_ocr_result_3step(html_edited, export_format, field_list)
             
             # JavaScript函数：在导出前从DOM读取编辑后的表格内容并更新隐藏的Textbox
             js_code = """
@@ -5110,18 +5291,18 @@ def create_unified_interface():
                 return [fullContent];
             }
             """
-            
+
             # 使用JavaScript更新隐藏的Textbox，然后导出
             # 第一步：JavaScript更新bill_ocr_result_html_edited组件
             # 第二步：从bill_ocr_result_html_edited读取内容并导出
             bill_ocr_export_btn_3step.click(
-                fn=None,  # 不使用Python函数，只执行JavaScript
-                inputs=None,
-                outputs=[bill_ocr_result_html_edited],  # JavaScript返回的值更新这个组件
+                fn=lambda x: x,  # 简单的匿名函数：输入什么，返回什么
+                inputs=[bill_ocr_result_html_edited], # 占位，确保参数数量匹配
+                outputs=[bill_ocr_result_html_edited], 
                 js=js_code
             ).then(
                 export_with_js_content,
-                inputs=[bill_ocr_result_html_edited, bill_ocr_export_format],
+                inputs=[bill_ocr_result_html_edited, bill_ocr_export_format, bill_field_list],
                 outputs=[bill_ocr_export_status_3step]
             )
 

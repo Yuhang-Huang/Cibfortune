@@ -832,6 +832,95 @@ class CardOCRWithRAG:
                 "generation_time": 0
             }
     
+    def general_prompt(
+        self,
+        custom_prompt: Optional[str],
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+        top_p: float = 0.8,
+    ) -> Dict:
+        if not self.is_loaded:
+            return {
+                "success": False,
+                "error": "模型未加载，请先调用load_model()",
+                "result": None,
+                "rag_info": None,
+                "generation_time": 0
+            }
+        
+        # 默认提示词
+        # default_prompt = (
+        #     "你是专业的卡证OCR引擎。请对图片进行结构化识别：\n"
+        #     "1) 判断卡证类型（身份证/银行卡/驾驶证/护照/工牌/其他）；\n"
+        #     "2) 以Markdown表格输出关键字段和值；字段示例：姓名/姓名(EN)、性别、民族、生日、住址、公民身份号码、签发机关、有效期限、卡号、有效期、发卡行等，卡号中只能包含数字；\n"
+        #     "3) 若有头像或水印信息，请在表格下方以文本补充说明；\n"
+        #     "4) 保持原图文字内容尽量完整，不要输出围栏代码块；\n"
+        #     "5) 如果和给定的卡证图片库中的图片相似，请在表格下方给出相似度，并给出相似卡证的图片名称。"
+        # )
+        default_prompt = None
+        
+        
+        # 在终端输出发送给API的完整prompt
+        print("\n" + "=" * 80)
+        print("📝 发送给API的完整Prompt")
+        print("=" * 80)
+        print(custom_prompt)
+        print("=" * 80 + "\n")
+        
+        # 准备Qwen API消息格式（兼容OpenAI格式）
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": custom_prompt
+                    }
+                ]
+            }
+        ]
+        
+        # 调用Qwen API
+        try:
+            start_time = time.time()
+            
+            # 准备API参数
+            api_params = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            
+            # top_p参数：如果小于1.0则添加，否则不传（使用默认值）
+            if top_p < 1.0:
+                api_params["top_p"] = top_p
+            
+            response = self.client.chat.completions.create(**api_params)
+            
+            generation_time = time.time() - start_time
+            
+            # 提取响应文本
+            result_text = response.choices[0].message.content
+            
+            # 构建RAG信息
+            rag_info = None
+            
+            return {
+                "success": True,
+                "result": result_text,
+                "generation_time": generation_time,
+                "error": None
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "result": None,
+                "generation_time": 0
+            }
+
     def recognize_from_file(
         self,
         image_path: str,
