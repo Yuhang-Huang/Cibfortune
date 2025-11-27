@@ -5056,6 +5056,157 @@ def create_unified_interface():
                         
                         return data
                     
+                    def html_to_excel(html_content, output_path):
+                        import pandas as pd
+                        from bs4 import BeautifulSoup
+                        from openpyxl import Workbook
+                        from openpyxl.styles import Alignment
+                        from openpyxl.utils import get_column_letter
+                        soup = BeautifulSoup(html_content, 'html.parser')
+                        table = soup.find('table')
+                        
+                        if not table:
+                            print("未找到表格")
+                            return
+
+                        wb = Workbook()
+                        ws = wb.active
+                        
+                        # 1. 初始化一个矩阵来跟踪被占用的单元格 (行, 列)
+                        # 这是一个简单的稀疏矩阵逻辑: occupied_cells[(row, col)] = True
+                        occupied_cells = set()
+                        
+                        # 获取所有行
+                        rows = table.find_all('tr')
+                        
+                        # 遍历 HTML 行
+                        for r_idx, row in enumerate(rows):
+                            # 找到当前行内所有的单元格 (th 和 td)
+                            cells = row.find_all(['td', 'th'])
+                            
+                            c_idx = 0 # 当前行的列指针
+                            
+                            for cell in cells:
+                                # 1.1 跳过已经被上一行 rowspan 占用的位置
+                                while (r_idx, c_idx) in occupied_cells:
+                                    c_idx += 1
+                                
+                                # 1.2 获取 HTML 属性
+                                rowspan = int(cell.get('rowspan', 1))
+                                colspan = int(cell.get('colspan', 1))
+                                text_value = cell.get_text(strip=True)
+                                
+                                # 尝试将数字字符串转为数字（可选，为了Excel格式更好看）
+                                try:
+                                    if text_value.replace('.', '', 1).isdigit():
+                                        if '.' in text_value:
+                                            text_value = float(text_value)
+                                        else:
+                                            text_value = int(text_value)
+                                except ValueError:
+                                    pass
+
+                                # 1.3 写入数据到 Excel (Openpyxl 是 1-based 索引，所以要 +1)
+                                # 我们只把值写入合并区域的左上角第一个单元格
+                                excel_row = r_idx + 1
+                                excel_col = c_idx + 1
+                                cell_obj = ws.cell(row=excel_row, column=excel_col, value=text_value)
+                                
+                                # 设置居中，美观起见
+                                cell_obj.alignment = Alignment(horizontal='center', vertical='center')
+
+                                # 1.4 处理合并
+                                if rowspan > 1 or colspan > 1:
+                                    # 计算结束坐标
+                                    end_row = excel_row + rowspan - 1
+                                    end_col = excel_col + colspan - 1
+                                    
+                                    ws.merge_cells(start_row=excel_row, start_column=excel_col,
+                                                end_row=end_row, end_column=end_col)
+                                    
+                                    # 1.5 标记被占用的格子，以便后续循环跳过
+                                    for r in range(rowspan):
+                                        for c in range(colspan):
+                                            # 标记矩阵中的位置 (0-based)
+                                            occupied_cells.add((r_idx + r, c_idx + c))
+                                else:
+                                    # 如果没有合并，也要标记当前位置已占用
+                                    occupied_cells.add((r_idx, c_idx))
+                                
+                                # 移动列指针 (当前单元格本身可能跨了多列)
+                                # 注意：这里不需要手动加 colspan，因为上面的 while 循环和 occupy 逻辑会自动处理
+                                # 但为了逻辑简单，我们只简单步进，让 while 循环去判断
+                                # 实际上，HTML流式布局中，当前标签处理完，指针应该指向下一个逻辑单元格，
+                                # 下一个逻辑单元格的实际物理位置由 occupied_cells 决定。
+                                # 这里只需简单 +1 ? 不，如果不考虑 rowspan，由于 colspan 占据了位置，
+                                # HTML 下一个 td 对应的应该是 c_idx + colspan。
+                                # 但因为我们用了 occupied_cells 机制来全盘控制，
+                                # 最稳健的方法是只增加 1 (处理下一个td标签)，但上面的 while 会自动把 c_idx 推到正确位置。
+                                # 然而，为了避免逻辑死循环，当前 cell 自身的 colspan 需要被跳过吗？
+                                # 不，HTML的 td 是挨个排列的。
+                                # 例子：<tr><td colspan=2>A</td><td>B</td></tr>
+                                # 处理A: c_idx=0. 占用了(0,0)和(0,1).
+                                # 下一个循环处理B: c_idx 初始为 0? 不，我们需要累加器。
+                                # 让我们修正一下逻辑：我们不应该在循环里 c_idx += 1，而是由逻辑控制。
+                                
+                                pass # 这一行实际上不需要做任何事，因为下一次循环开始时的 while 会处理
+                                
+                            # 这里的逻辑稍微需要调整，上面的 for cell in cells 并没有显式的 c_idx 累加器
+                            # 我们需要手动维护 c_idx
+                            # --- 修正后的内部循环逻辑 ---
+                            
+                        # --- 重新编写核心循环逻辑以确保万无一失 ---
+                        # 清空之前的写入，重新开始最稳健的逻辑
+                        wb = Workbook()
+                        ws = wb.active
+                        occupied_cells = set()
+                        
+                        for r_idx, row in enumerate(rows):
+                            cells = row.find_all(['td', 'th'])
+                            c_idx = 0 # 每一行开始，列指针归零
+                            
+                            for cell in cells:
+                                # 只要当前坐标被之前行的 rowspan 占用了，就向右移动
+                                while (r_idx, c_idx) in occupied_cells:
+                                    c_idx += 1
+                                
+                                rowspan = int(cell.get('rowspan', 1))
+                                colspan = int(cell.get('colspan', 1))
+                                text_value = cell.get_text(strip=True)
+                                
+                                # 写入值
+                                ws.cell(row=r_idx+1, column=c_idx+1, value=text_value).alignment = Alignment(horizontal='center', vertical='center')
+                                
+                                # 执行合并
+                                if rowspan > 1 or colspan > 1:
+                                    ws.merge_cells(start_row=r_idx+1, start_column=c_idx+1,
+                                                end_row=r_idx+rowspan, end_column=c_idx+colspan)
+                                
+                                # 标记占用
+                                for r in range(rowspan):
+                                    for c in range(colspan):
+                                        occupied_cells.add((r_idx + r, c_idx + c))
+                                
+                                # 处理完当前 HTML 标签后，列指针其实只需要向前移动 colspan 的距离
+                                # 因为当前标签实际上横向占据了 colspan 个位置
+                                # 如果不手动加，下一次循环 while 会检测到 occupied 并自动加，
+                                # 但手动加更符合直觉
+                                # c_idx += colspan # 这种写法有风险，因为 loop 结束回到 while 可能会重复判断
+                                # 最简单的方式：不用手动加，让 while ((r, c) in occupied) c++ 自动处理
+                                # 只需要在最后做一次 +1 即可吗？
+                                # 不，必须基于 HTML 的流式特性。HTML的一个 cell 处理完，下一个 cell 紧接着有效空位。
+                                # 所以在标记完占用后，我们什么都不用做，直接进入下一次 cell 循环？
+                                # 不对，当前 cell 在 c_idx。下一个 cell 应该从 c_idx + colspan 开始找空位吗？
+                                # 是的。因为当前 cell 占据了横向空间。
+                                # 所以：
+                                
+                                c_idx += colspan 
+                                # 此时 c_idx 指向了当前单元格右边的第一个位置（可能是空的，也可能被上一行的 rowspan 占用了）
+                                # 下一次循环的 while 会处理那个占用情况。
+
+                        wb.save(output_path)
+                        print(f"转换成功！文件已保存至: {output_path}")
+
                     # 使用简单方法提取数据
                     table_data = extract_simple_table_data(table)
                     
@@ -5083,7 +5234,6 @@ def create_unified_interface():
                         if not table_data:
                             return gr.update(visible=True, value="❌ 表格数据为空，无法导出！请检查表格格式。")
                     
-                    res = app.get_dict_from_html(html_content)
 
                     if export_format == "Markdown (.md)":
                         markdown_lines = ["## 票据OCR识别结果\n\n| 字段名 | 字段值 |"]
@@ -5102,53 +5252,11 @@ def create_unified_interface():
                         abs_file_path = os.path.abspath(file_path)
                         return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Markdown文件已保存到:\n{abs_file_path}")
                     elif export_format == "Excel (.xlsx)":
-                        import pandas as pd
-                        from pandas.io.html import read_html
-                        import openpyxl
-
                         try:
                             # 读取HTML表格
-                            tables = read_html(html_content)
-                            
-                            if not tables:
-                                print("未找到HTML表格")
-                                return
-                            
-                            print(f"找到 {len(tables)} 个表格")
                             file_name = f"bill_ocr_{timestamp}.xlsx"
                             file_path = os.path.join(export_dir, file_name)
-                            sheet_name = "Sheet1"
-                            # 创建Excel写入器
-                            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-                                for i, table in enumerate(tables):
-                                    # 如果有多个表格，使用不同的工作表
-                                    current_sheet = f"{sheet_name}_{i+1}" if len(tables) > 1 else sheet_name
-                                    
-                                    # 将DataFrame写入Excel，保持索引和表头
-                                    table.to_excel(
-                                        writer, 
-                                        sheet_name=current_sheet, 
-                                        index=False,  # 不包含行索引
-                                        header=True   # 包含列标题
-                                    )
-                                    
-                                    # 获取工作表对象进行格式调整
-                                    worksheet = writer.sheets[current_sheet]
-                                    
-                                    # 自动调整列宽
-                                    for column in worksheet.columns:
-                                        max_length = 0
-                                        column_letter = column[0].column_letter
-                                        for cell in column:
-                                            try:
-                                                if len(str(cell.value)) > max_length:
-                                                    max_length = len(str(cell.value))
-                                            except:
-                                                pass
-                                        adjusted_width = min(max_length + 2, 50)  # 限制最大宽度
-                                        worksheet.column_dimensions[column_letter].width = adjusted_width
-                            
-                            print(f"Excel文件已保存: {file_name}")
+                            html_to_excel(html_content, file_path)
                             abs_file_path = os.path.abspath(file_path)
                             return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Excel文件已保存到:\n{abs_file_path}")
                         except Exception as e:
@@ -5158,18 +5266,19 @@ def create_unified_interface():
 
                         # df.to_excel(file_path, index=False)
 
-                    elif export_format == "CSV (.csv)":
-                        import pandas as pd
-                        df = pd.DataFrame(res.values())
-                        file_name = f"bill_ocr_{timestamp}.csv"
-                        file_path = os.path.join(export_dir, file_name)
-                        df.to_csv(file_path, index=False, encoding='utf-8-sig')
-                        abs_file_path = os.path.abspath(file_path)
-                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 CSV文件已保存到:\n{abs_file_path}")
+                    # elif export_format == "CSV (.csv)":
+                    #     import pandas as pd
+                    #     df = pd.DataFrame(res.values())
+                    #     file_name = f"bill_ocr_{timestamp}.csv"
+                    #     file_path = os.path.join(export_dir, file_name)
+                    #     df.to_csv(file_path, index=False, encoding='utf-8-sig')
+                    #     abs_file_path = os.path.abspath(file_path)
+                    #     return gr.update(visible=True, value=f"✅ 导出成功！\n📄 CSV文件已保存到:\n{abs_file_path}")
                     elif export_format == "JSON (.json)":
                         import json
                         file_name = f"bill_ocr_{timestamp}.json"
                         file_path = os.path.join(export_dir, file_name)
+                        res = app.get_dict_from_html(html_content)
                         with open(file_path, "w", encoding="utf-8") as f:
                             json.dump(res, f, ensure_ascii=False, indent=2)
                         abs_file_path = os.path.abspath(file_path)
