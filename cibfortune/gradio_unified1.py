@@ -6,6 +6,8 @@ Qwen3-VL-8B-Instruct 统一Gradio界面
 """
 
 import os
+# 禁用 Gradio analytics 以避免网络连接错误（不影响功能）
+os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'
 import json
 import inspect
 import io
@@ -22,6 +24,42 @@ import gc
 import gradio as gr
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from ocr_card_rag_api import CardOCRWithRAG
+from PIL import Image
+
+# PaddleOCR API 配置（使用 API 调用，不需要本地安装 PaddleOCR）
+PADDLEOCR_API_URL = "https://wdc9jbw9l1f8996b.aistudio-app.com/ocr"
+PADDLEOCR_TOKEN = "61236296494fb5e32ee89aef50d4d6aa99fa2ba7"
+
+# 尝试导入PDF处理库
+PDF_AVAILABLE = False
+PDF2IMAGE_AVAILABLE = False
+PYMUPDF_AVAILABLE = False
+
+# 尝试导入 pdf2image
+try:
+    from pdf2image import convert_from_path, convert_from_bytes
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    pass
+
+# 尝试导入 PyMuPDF
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    pass
+
+# 确定使用哪个库（优先使用 PyMuPDF，因为它不需要外部依赖）
+if PYMUPDF_AVAILABLE:
+    PDF_AVAILABLE = True
+    PDF_LIB = "pymupdf"
+elif PDF2IMAGE_AVAILABLE:
+    PDF_AVAILABLE = True
+    PDF_LIB = "pdf2image"
+else:
+    PDF_AVAILABLE = False
+    PDF_LIB = None
+    print("⚠️ PDF处理库未安装，文档OCR将不支持PDF格式。可安装: pip install PyMuPDF 或 pip install pdf2image")
 
 try:
     import torch
@@ -55,6 +93,14 @@ class AdvancedQwen3VLApp:
         self.card_api = None
         # API 票据OCR（使用qwen-vl-max模型）
         self.bill_api = None
+        # API 文档OCR（使用qwen3-vl-plus模型）
+        self.doc_api = None
+        # 文档OCR（使用 PaddleOCR API，不需要本地 PaddleOCR）
+        self.last_ocr_text = None
+        self.last_ocr_page_texts = []  # 每页的文本列表
+        self.last_ocr_text_chunks = []  # 文本切片列表
+        self.last_ocr_output_dir = None
+        self.last_ocr_files = {}
         # 字段模板文件
         self.field_templates_file = "card_field_templates.md"
         # 当前识别的卡证类型和字段
@@ -272,6 +318,24 @@ class AdvancedQwen3VLApp:
             self.bill_api = api
         except Exception:
             self.bill_api = None
+
+    def _ensure_doc_api_loaded(self):
+        """懒加载文档OCR API（使用qwen3-vl-plus模型）"""
+        if self.doc_api is not None:
+            return
+        try:
+            api = CardOCRWithRAG(
+                api_key=None,
+                model="qwen3-vl-plus",  # 文档OCR使用qwen3-vl-plus模型
+                rag_image_dir=None,  # 文档OCR不使用RAG
+                persist_directory=None,
+            )
+            api.load_model()
+            # 文档OCR不使用RAG，跳过RAG库加载
+            self.doc_api = api
+        except Exception as e:
+            print(f"⚠️ 文档OCR 加载失败: {e}")
+            self.doc_api = None
 
     def _load_field_templates(self):
         """从card_field_templates目录下的md文件加载字段模板"""
@@ -566,7 +630,7 @@ class AdvancedQwen3VLApp:
         try:
             self._ensure_card_api_loaded()
             if self.card_api is None:
-                return None, [], "❌ 卡证OCR API未初始化"
+                return None, [], "❌ 卡证OCR 未初始化"
             
             # 使用简化的提示词只识别卡证类型（不包含银行承兑汇票）
             type_prompt = (
@@ -629,7 +693,7 @@ class AdvancedQwen3VLApp:
         try:
             self._ensure_bill_api_loaded()
             if self.bill_api is None:
-                return None, [], None, "❌ 票据OCR API未初始化"
+                return None, [], None, "❌ 票据OCR 未初始化"
             
             # 票据OCR只识别银行承兑汇票
             type_prompt = (
@@ -717,7 +781,7 @@ class AdvancedQwen3VLApp:
         try:
             self._ensure_card_api_loaded()
             if self.card_api is None:
-                return "❌ 卡证OCR API未初始化"
+                return "❌ 卡证OCR 未初始化"
             
             # 构建包含字段列表的提示词
             fields_list = "、".join(fields_to_extract)
@@ -1194,7 +1258,7 @@ class AdvancedQwen3VLApp:
         try:
             self._ensure_bill_api_loaded()
             if self.bill_api is None:
-                return "❌ 票据OCR API未初始化"
+                return "❌ 票据OCR 未初始化"
             
             # 构建包含字段列表的提示词
             fields_list = "、".join(fields_to_extract)
@@ -2224,7 +2288,7 @@ class AdvancedQwen3VLApp:
             return f"❌ OCR识别失败: {str(e)}"
 
     def ocr_card(self, image, prompt: str = None):
-        """卡证OCR识别：身份证/银行卡/驾驶证等结构化提取（使用本地模型，流程与API版本一致）"""
+        """卡证OCR识别：身份证/银行卡/驾驶证等结构化提取（使用本地模型）"""
         if not self.is_loaded:
             return "❌ 请先加载模型！"
         
@@ -2329,7 +2393,7 @@ class AdvancedQwen3VLApp:
         try:
             self._ensure_card_api_loaded()
             if self.card_api is None:
-                return "�?卡证OCR API初始化失败"
+                return "�?卡证OCR 初始化失败"
             default_prompt = (
                 "你是专业的卡证OCR引擎，请对输入图片进行结构化识别，并仅输出Markdown表格。\n"
                 "\n"
@@ -2369,7 +2433,7 @@ class AdvancedQwen3VLApp:
                 use_rag=True,
             )
             if not result.get("success"):
-                return f"�?卡证OCR API调用失败: {result.get('error') or '未知错误'}"
+                return f"�?卡证OCR 调用失败: {result.get('error') or '未知错误'}"
 
             # 在终端输出RAG相似度匹配结果
             rag_info = result.get("rag_info")
@@ -2390,11 +2454,11 @@ class AdvancedQwen3VLApp:
                 print("\n⚠️ 未找到相似图片\n")
 
             cleaned = self._sanitize_markdown(result.get("result") or "")
-            self.last_ocr_markdown = f"## 卡证OCR识别（API）结果\n\n{cleaned}"
-            self.last_ocr_html = "<h2>卡证OCR识别（API）结果</h2>" + self._render_sections_as_html(cleaned)
-            return f"🪪 卡证OCR识别（API）结果:\n\n{cleaned}"
+            self.last_ocr_markdown = f"## 卡证OCR识别结果\n\n{cleaned}"
+            self.last_ocr_html = "<h2>卡证OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
+            return f"🪪 卡证OCR识别结果:\n\n{cleaned}"
         except Exception as e:
-            return f"�?卡证OCR API识别失败: {str(e)}"
+            return f"�?卡证OCR识别失败: {str(e)}"
 
     def ocr_receipt(self, image, prompt: str = None):
         """票据OCR识别：发票/小票等表格与关键项解析"""
@@ -2460,6 +2524,810 @@ class AdvancedQwen3VLApp:
             return str(exc)
         except Exception as e:
             return f"❌ 协议OCR识别失败: {str(e)}"
+
+    def _format_ocr_result(self, result):
+        """
+        格式化 OCR 结果为纯文本字符串（只提取 rec_texts 内容，不包含坐标等信息）
+        
+        Args:
+            result: OCR 结果，可能是字符串、字典或其他类型
+            
+        Returns:
+            格式化后的纯文本字符串（只包含识别到的文本内容）
+        """
+        import json
+        if result is None:
+            return ""
+        
+        if isinstance(result, str):
+            # 如果是字符串，直接返回
+            return result
+        elif isinstance(result, dict):
+            # 如果是字典，优先提取 rec_texts（PaddleOCR API 返回的文本字段）
+            if "rec_texts" in result:
+                rec_texts = result["rec_texts"]
+                if isinstance(rec_texts, list):
+                    # 如果是列表，合并所有文本行
+                    return "\n".join(str(text) for text in rec_texts if text)
+                else:
+                    return str(rec_texts)
+            # 其次查找其他常见的文本字段
+            elif "text" in result:
+                text = result["text"]
+                if isinstance(text, list):
+                    return "\n".join(str(t) for t in text if t)
+                return str(text)
+            elif "content" in result:
+                content = result["content"]
+                if isinstance(content, list):
+                    return "\n".join(str(c) for c in content if c)
+                return str(content)
+            elif "prunedResult" in result:
+                # 递归处理 prunedResult，提取其中的 rec_texts
+                return self._format_ocr_result(result["prunedResult"])
+            elif "result" in result:
+                return self._format_ocr_result(result["result"])
+            else:
+                # 如果字典中没有明确的文本字段，返回空字符串（不返回坐标等元数据）
+                return ""
+        elif isinstance(result, list):
+            # 如果是列表，提取每个元素的文本内容
+            text_parts = []
+            for item in result:
+                text = self._format_ocr_result(item)
+                if text:  # 只添加非空文本
+                    text_parts.append(text)
+            return "\n".join(text_parts)
+        else:
+            # 其他类型直接转换为字符串
+            return str(result)
+
+    def _chunk_text_for_rag(self, text, chunk_size=500, overlap=50, max_chunks=1000):
+        """
+        对文本进行切片，用于RAG相似度计算
+        
+        Args:
+            text: 要切片的文本
+            chunk_size: 每个切片的最大字符数
+            overlap: 切片之间的重叠字符数
+            max_chunks: 最大切片数量（防止内存溢出）
+            
+        Returns:
+            文本切片列表
+        """
+        if not text:
+            return []
+        
+        # 安全检查：确保 overlap < chunk_size，防止无限循环
+        if overlap >= chunk_size:
+            overlap = max(1, chunk_size // 10)  # 默认使用10%的重叠
+        
+        chunks = []
+        start = 0
+        text_length = len(text)
+        prev_start = -1  # 用于检测是否卡住
+        
+        # 如果文本太大，先限制处理范围
+        if text_length > 1000000:  # 如果超过1MB，只处理前1MB
+            print(f"⚠️ 文本过大（{text_length}字符），仅处理前1MB用于切片")
+            text = text[:1000000]
+            text_length = len(text)
+        
+        while start < text_length and len(chunks) < max_chunks:
+            end = min(start + chunk_size, text_length)
+            chunk = text[start:end].strip()
+            
+            if chunk:
+                chunks.append(chunk)
+            
+            # 计算下一个起始位置
+            next_start = end - overlap
+            # 安全检查：确保向前移动
+            if next_start <= start:
+                next_start = start + 1  # 至少移动1个字符
+            
+            # 防止卡在同一个位置
+            if next_start == prev_start:
+                next_start = start + chunk_size  # 强制移动
+            
+            prev_start = start
+            start = next_start
+        
+        if len(chunks) >= max_chunks:
+            print(f"⚠️ 切片数量达到上限（{max_chunks}），已停止切片")
+        
+        return chunks
+    
+    def _calculate_text_similarity(self, query, text):
+        """
+        计算查询文本与目标文本的相似度（使用简单的词重叠度）
+        
+        Args:
+            query: 查询文本（关键字段）
+            text: 目标文本（切片内容）
+            
+        Returns:
+            相似度分数（0-1之间）
+        """
+        if not query or not text:
+            return 0.0
+        
+        # 转换为小写并分词
+        query_words = set(query.lower().split())
+        text_words = set(text.lower().split())
+        
+        if not query_words:
+            return 0.0
+        
+        # 计算交集和并集
+        intersection = query_words & text_words
+        union = query_words | text_words
+        
+        # Jaccard相似度
+        if not union:
+            return 0.0
+        
+        jaccard = len(intersection) / len(union)
+        
+        # 同时考虑查询词在文本中的出现频率
+        text_lower = text.lower()
+        query_lower = query.lower()
+        if query_lower in text_lower:
+            # 如果查询文本完全包含在目标文本中，增加相似度
+            jaccard = max(jaccard, 0.5)
+        
+        return jaccard
+    
+    def _rag_search_text_chunks(self, key_fields, text_chunks, top_k=3):
+        """
+        根据关键字段对文本切片进行RAG相似度映射，返回相似度最高的top_k个切片
+        
+        Args:
+            key_fields: 关键字段列表（用户自定义）
+            text_chunks: 文本切片列表
+            top_k: 返回最相似的切片数量
+            
+        Returns:
+            每个关键字段对应的最相似切片列表
+        """
+        if not key_fields or not text_chunks:
+            return {}
+        
+        field_chunks = {}
+        
+        for field in key_fields:
+            if not field or not field.strip():
+                continue
+            
+            field = field.strip()
+            similarities = []
+            
+            # 计算每个切片与关键字段的相似度
+            for idx, chunk in enumerate(text_chunks):
+                similarity = self._calculate_text_similarity(field, chunk)
+                similarities.append({
+                    'chunk_index': idx,
+                    'chunk_text': chunk,
+                    'similarity': similarity
+                })
+            
+            # 按相似度排序，取top_k
+            similarities.sort(key=lambda x: x['similarity'], reverse=True)
+            top_chunks = similarities[:top_k]
+            
+            field_chunks[field] = top_chunks
+        
+        return field_chunks
+
+    def _pdf_to_images(self, pdf_path_or_bytes):
+        """
+        将PDF转换为图像列表
+        
+        Args:
+            pdf_path_or_bytes: PDF文件路径或字节数据
+            
+        Returns:
+            图像列表（PIL Image对象）
+        """
+        if not PDF_AVAILABLE:
+            return None
+        
+        # 优先尝试 PyMuPDF（不需要外部依赖）
+        if PYMUPDF_AVAILABLE:
+            try:
+                import fitz
+                from PIL import Image as PILImage
+                if isinstance(pdf_path_or_bytes, bytes):
+                    pdf_doc = fitz.open(stream=pdf_path_or_bytes, filetype="pdf")
+                else:
+                    pdf_doc = fitz.open(pdf_path_or_bytes)
+                
+                images = []
+                for page_num in range(len(pdf_doc)):
+                    page = pdf_doc[page_num]
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x缩放提高清晰度
+                    img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    images.append(img)
+                pdf_doc.close()
+                return images
+            except Exception as e:
+                print(f"⚠️ PyMuPDF转换失败: {e}，尝试使用pdf2image...")
+                # 如果 PyMuPDF 失败，尝试 pdf2image
+        
+        # 回退到 pdf2image（需要 poppler）
+        if PDF2IMAGE_AVAILABLE:
+            try:
+                if isinstance(pdf_path_or_bytes, bytes):
+                    images = convert_from_bytes(pdf_path_or_bytes)
+                else:
+                    images = convert_from_path(pdf_path_or_bytes)
+                return images
+            except Exception as e:
+                error_msg = str(e)
+                if "poppler" in error_msg.lower():
+                    print(f"⚠️ PDF转换失败: {error_msg}")
+                    print("💡 提示: pdf2image需要poppler，建议安装PyMuPDF: pip install PyMuPDF")
+                else:
+                    print(f"⚠️ PDF转换失败: {e}")
+                return None
+        
+        return None
+
+    def ocr_document(self, image_or_file, prompt: str = None, is_pdf: bool = False, pdf_pages: str = "all"):
+        """
+        文档OCR识别：使用 PaddleOCR API 直接调用
+        提取到的文字保存下来准备进行切片做RAG知识库
+        
+        Args:
+            image_or_file: 图像（PIL Image）或文件路径/字节数据
+            prompt: 自定义提示词（暂不使用，保留兼容性）
+            is_pdf: 是否为PDF文件
+            pdf_pages: PDF页码，如"all"表示所有页，"1,3,5"表示指定页
+        """
+        import os
+        import base64
+        import requests
+        import json
+        import time
+        from pathlib import Path
+        from PIL import Image
+        import tempfile
+        
+        try:
+            # 确定文件路径或处理字节数据
+            is_temp = False
+            file_path = None
+            
+            if isinstance(image_or_file, Image.Image):
+                # 如果是 PIL Image，需要先保存为临时文件
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                    image_or_file.save(tmp.name, 'PNG')
+                    file_path = tmp.name
+                    is_temp = True
+            elif isinstance(image_or_file, str):
+                # 如果是文件路径
+                file_path = image_or_file
+                is_temp = False
+            elif isinstance(image_or_file, bytes):
+                # 如果是字节数据（PDF或图片的字节流）
+                # 根据 is_pdf 参数确定文件扩展名
+                suffix = '.pdf' if is_pdf else '.png'
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(image_or_file)
+                    file_path = tmp.name
+                    is_temp = True
+            else:
+                return "❌ 不支持的文件类型（需要 PIL Image、文件路径或字节数据）"
+            
+            if not file_path or not os.path.exists(file_path):
+                return f"❌ 文件不存在: {file_path}"
+            
+            # 创建输出目录（用于保存OCR结果，准备RAG切片）
+            output_dir = "ocr_output"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 读取文件并编码
+            print(f"正在读取文件: {file_path}")
+            with open(file_path, "rb") as file:
+                file_bytes = file.read()
+            file_data = base64.b64encode(file_bytes).decode("ascii")
+            
+            file_size_mb = len(file_bytes) / (1024 * 1024)
+            print(f"文件大小: {file_size_mb:.2f} MB")
+            
+            # 准备请求
+            headers = {
+                "Authorization": f"token {PADDLEOCR_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            # 根据文件类型设置 fileType
+            if is_pdf or file_path.lower().endswith('.pdf'):
+                file_type = 0  # PDF
+            else:
+                file_type = 1  # 图片
+            
+            payload = {
+                "file": file_data,
+                "fileType": file_type,
+                "useDocOrientationClassify": False,
+                "useDocUnwarping": False,
+                "useTextlineOrientation": False,
+            }
+            
+            # 发送请求
+            print("正在进行PaddleOCR识别...")
+            start_time = time.time()
+            
+            # 根据文件大小设置超时
+            timeout = max(600, int(file_size_mb * 60))
+            
+            response = requests.post(PADDLEOCR_API_URL, json=payload, headers=headers, timeout=timeout)
+            
+            elapsed_time = time.time() - start_time
+            print(f"响应时间: {elapsed_time:.2f}秒")
+            
+            if response.status_code != 200:
+                return f"❌ 请求失败，状态码: {response.status_code}\n响应: {response.text[:500]}"
+            
+            result = response.json()
+            
+            if "result" not in result:
+                return f"❌ 响应格式错误: {result}"
+            
+            ocr_result = result["result"]
+            ocr_results = ocr_result.get("ocrResults", [])
+            
+            if not ocr_results:
+                return "❌ 未识别到任何内容"
+            
+            # 获取输入文件名（不含扩展名）
+            input_filename = os.path.splitext(os.path.basename(file_path))[0]
+            
+            # 收集所有页面的文本内容（用于RAG切片）
+            all_text_parts = []
+            all_markdown_parts = []
+            
+            # 保存文本结果（合并所有页面）
+            txt_file = os.path.join(output_dir, f"{input_filename}_ocr.txt")
+            md_file = os.path.join(output_dir, f"{input_filename}_ocr.md")
+            json_file = os.path.join(output_dir, f"{input_filename}_ocr.json")
+            
+            with open(txt_file, "w", encoding="utf-8") as f:
+                for i, res in enumerate(ocr_results):
+                    pruned_result = res.get("prunedResult", "")
+                    formatted_result = self._format_ocr_result(pruned_result)
+                    all_text_parts.append(formatted_result)
+                    
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"第 {i + 1} 页\n")
+                    f.write(f"{'='*60}\n\n")
+                    f.write(formatted_result)
+                    f.write("\n\n")
+            
+            # 保存 Markdown 格式
+            with open(md_file, "w", encoding="utf-8") as f:
+                f.write(f"# {input_filename} OCR 结果\n\n")
+                for i, res in enumerate(ocr_results):
+                    pruned_result = res.get("prunedResult", "")
+                    formatted_result = self._format_ocr_result(pruned_result)
+                    all_markdown_parts.append(formatted_result)
+                    
+                    f.write(f"## 第 {i + 1} 页\n\n")
+                    if "\n" in formatted_result:
+                        f.write("```\n")
+                        f.write(formatted_result)
+                        f.write("\n```\n")
+                    else:
+                        f.write(formatted_result)
+                    f.write("\n\n---\n\n")
+            
+            # 保存 JSON 结果
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(ocr_result, f, ensure_ascii=False, indent=2)
+            
+            # 下载并保存图片（如果需要）
+            saved_images = 0
+            for i, res in enumerate(ocr_results):
+                image_url = res.get("ocrImage")
+                if image_url:
+                    try:
+                        img_response = requests.get(image_url, timeout=30)
+                        if img_response.status_code == 200:
+                            img_filename = os.path.join(output_dir, f"{input_filename}_page_{i + 1}.jpg")
+                            with open(img_filename, "wb") as f:
+                                f.write(img_response.content)
+                            saved_images += 1
+                    except:
+                        pass
+            
+            # 合并所有文本（用于RAG切片）
+            full_text = "\n\n".join(all_text_parts)
+            
+            # 保存每页的rec_texts文本（用于分页显示和RAG处理）
+            page_texts = []  # 每页的文本列表
+            for i, res in enumerate(ocr_results):
+                pruned_result = res.get("prunedResult", {})
+                if isinstance(pruned_result, dict) and "rec_texts" in pruned_result:
+                    rec_texts = pruned_result["rec_texts"]
+                    if isinstance(rec_texts, list):
+                        page_text = "\n".join(str(text) for text in rec_texts if text)
+                    else:
+                        page_text = str(rec_texts)
+                else:
+                    page_text = all_text_parts[i] if i < len(all_text_parts) else ""
+                page_texts.append(page_text)
+            
+            # 先构建并返回结果（不等待文本切片）
+            result_markdown = f"## 文档OCR识别结果\n\n"
+            result_markdown += f"### 📄 文件信息\n\n"
+            result_markdown += f"**文件名：** {input_filename}\n"
+            result_markdown += f"**文件类型：** {'PDF' if file_type == 0 else '图片'}\n"
+            result_markdown += f"**识别页数：** {len(ocr_results)}\n"
+            result_markdown += f"**处理时间：** {elapsed_time:.2f}秒\n\n"
+            
+            result_markdown += f"### 📝 识别文本（第1页，共{len(page_texts)}页）\n\n"
+            if page_texts:
+                result_markdown += f"{page_texts[0][:1000]}{'...' if len(page_texts[0]) > 1000 else ''}\n\n"
+            
+            result_markdown += f"### 💾 保存的文件\n\n"
+            result_markdown += f"- **文本文件：** `{txt_file}`\n"
+            result_markdown += f"- **Markdown文件：** `{md_file}`\n"
+            result_markdown += f"- **JSON文件：** `{json_file}`\n"
+            if saved_images > 0:
+                result_markdown += f"- **OCR图片：** {saved_images} 张\n"
+            result_markdown += f"\n### 📚 RAG准备\n\n"
+            result_markdown += f"⏳ 正在对文本进行切片处理，完成后可用于RAG相似度映射。总字符数：{len(full_text)}\n"
+            
+            # 先保存基础数据到实例变量
+            self.last_ocr_text = full_text
+            self.last_ocr_page_texts = page_texts  # 保存每页文本
+            self.last_ocr_markdown = result_markdown
+            self.last_ocr_output_dir = output_dir
+            self.last_ocr_files = {
+                'txt': txt_file,
+                'md': md_file,
+                'json': json_file
+            }
+            
+            # 清理临时文件
+            if is_temp and os.path.exists(file_path):
+                try:
+                    os.unlink(file_path)
+                except:
+                    pass
+            
+            self.last_ocr_html = "<h2>文档OCR识别结果</h2>" + self._render_sections_as_html(result_markdown)
+            
+            # 在后台进行文本切片（不阻塞返回）
+            try:
+                # 对于大文本，使用更大的切片大小以减少切片数量
+                chunk_size = 1000 if len(full_text) > 100000 else 500
+                text_chunks = self._chunk_text_for_rag(full_text, chunk_size=chunk_size, max_chunks=500)
+                print(f"✅ 文本切片完成，共 {len(text_chunks)} 个切片")
+                # 更新实例变量
+                self.last_ocr_text_chunks = text_chunks
+            except MemoryError as e:
+                print(f"⚠️ 内存不足，使用简化切片策略: {e}")
+                # 如果内存不足，使用更大的切片，减少切片数量
+                try:
+                    text_chunks = self._chunk_text_for_rag(full_text, chunk_size=2000, overlap=100, max_chunks=200)
+                    self.last_ocr_text_chunks = text_chunks
+                except:
+                    # 如果还是失败，至少保存完整文本作为一个大切片
+                    self.last_ocr_text_chunks = [full_text[:50000]] if len(full_text) > 50000 else [full_text]
+            except Exception as e:
+                print(f"⚠️ 文本切片失败: {e}")
+                # 如果切片失败，至少保存完整文本作为一个大切片
+                self.last_ocr_text_chunks = [full_text[:50000]] if len(full_text) > 50000 else [full_text]
+            
+            return result_markdown
+            
+        except requests.exceptions.Timeout:
+            return f"❌ 请求超时（超过 {timeout} 秒）"
+        except requests.exceptions.RequestException as e:
+            return f"❌ 请求失败: {e}"
+        except Exception as e:
+            import traceback
+            return f"❌ 处理过程中出现错误: {e}\n{traceback.format_exc()}"
+    
+    def extract_document_fields_with_rag(self, key_fields, custom_prompt=None):
+        """
+        识别关键字段：根据关键字段对文本切片进行相似度映射，
+        将相似度最高的三段文本提供给大模型进行信息抽取
+        
+        Args:
+            key_fields: 关键字段列表（用户自定义）
+            custom_prompt: 自定义提示词
+            
+        Returns:
+            信息抽取结果（表格形式，一个字段一行）
+        """
+        if not hasattr(self, 'last_ocr_text') or not self.last_ocr_text:
+            return "❌ 请先进行文档OCR识别"
+        
+        if not key_fields or not isinstance(key_fields, list):
+            return "❌ 请提供关键字段列表"
+        
+        # 过滤空字段
+        key_fields = [f.strip() for f in key_fields if f and f.strip()]
+        if not key_fields:
+            return "❌ 关键字段列表为空"
+        
+        try:
+            # 对每个关键字段进行RAG相似度映射（如果文本切片可用）
+            rag_context_parts = []
+            
+            if hasattr(self, 'last_ocr_text_chunks') and self.last_ocr_text_chunks:
+                print(f"🔍 开始RAG相似度匹配，共 {len(key_fields)} 个关键字段，{len(self.last_ocr_text_chunks)} 个文本切片")
+                
+                # 对每个关键字段进行RAG相似度匹配
+                field_chunks = self._rag_search_text_chunks(
+                    key_fields, 
+                    self.last_ocr_text_chunks, 
+                    top_k=3
+                )
+                
+                # 为每个字段组织相关文本切片
+                for field in key_fields:
+                    if field in field_chunks:
+                        chunks = field_chunks[field]
+                        if chunks:
+                            # 获取相似度最高的3个切片
+                            top_chunks = chunks[:3]
+                            field_texts = []
+                            for i, chunk_info in enumerate(top_chunks, 1):
+                                similarity = chunk_info['similarity']
+                                chunk_text = chunk_info['chunk_text']
+                                field_texts.append(f"[相似度: {similarity:.2%}] {chunk_text}")
+                            
+                            # 为每个字段组织相关文本
+                            field_context = f"**关键字段「{field}」的相关文本片段（相似度最高的3段）：**\n"
+                            field_context += "\n".join(field_texts)
+                            rag_context_parts.append(field_context)
+                            print(f"  ✅ {field}: 找到 {len(chunks)} 个相关片段")
+                        else:
+                            print(f"  ⚠️ {field}: 未找到相关片段")
+                    else:
+                        print(f"  ⚠️ {field}: 未找到相关片段")
+                
+                # 合并所有字段的相关文本
+                if rag_context_parts:
+                    rag_context = "\n\n".join(rag_context_parts)
+                else:
+                    # 如果没有找到相关片段，使用全文的前5000字符
+                    rag_context = f"**文档全文（前5000字符）：**\n{self.last_ocr_text[:5000]}"
+            else:
+                # 如果没有切片，使用全文的前5000字符
+                print("⚠️ 文本切片不可用，使用全文前5000字符")
+                rag_context = f"**文档全文（前5000字符）：**\n{self.last_ocr_text[:5000]}"
+            
+            # 构建提示词（要求大模型提取所有字段）
+            fields_list = "、".join([f"「{f}」" for f in key_fields])
+            default_prompt = (
+                f"你是专业的文档信息抽取专家。请从以下文档文本中提取以下关键字段的信息：{fields_list}\n\n"
+                f"**文档相关内容：**\n{rag_context}\n\n"
+                "**任务要求：**\n"
+                "1. 仔细阅读上述文档内容，特别是每个关键字段的相关文本片段\n"
+                "2. 从文档中提取每个关键字段的值\n"
+                "3. 只输出Markdown表格，格式如下：\n"
+                "| 字段名 | 字段值 |\n"
+                "|--------|--------|\n"
+                "4. 每个关键字段必须占一行，字段名和字段值都要填写\n"
+                "5. 如果某个字段在文档中找不到，字段值填写\"未找到\"\n"
+                "6. 只输出表格，不要输出其他说明文字、代码块标记或其他内容\n"
+                "7. 确保提取所有字段，不要遗漏\n"
+            )
+            
+            effective_prompt = custom_prompt if custom_prompt and custom_prompt.strip() else default_prompt
+            
+            # 使用qwen3-vl-plus API进行信息抽取
+            self._ensure_doc_api_loaded()
+            if self.doc_api is None or not self.doc_api.is_loaded:
+                return "❌ 文档OCR未加载"
+            
+            # 尝试获取第一页图像（如果有保存的OCR图像）
+            image_for_api = None
+            if hasattr(self, 'last_ocr_files') and self.last_ocr_files:
+                # 尝试加载第一页的OCR图像
+                try:
+                    from PIL import Image
+                    # 查找第一页图像
+                    output_dir = getattr(self, 'last_ocr_output_dir', 'ocr_output')
+                    import glob
+                    image_files = glob.glob(os.path.join(output_dir, '*_page_1.jpg'))
+                    if image_files:
+                        image_for_api = Image.open(image_files[0]).convert("RGB")
+                except:
+                    pass
+            
+            # 如果找不到图像，创建一个简单的占位图像或使用文本
+            try:
+                if image_for_api is None:
+                    # 创建一个简单的文本图像占位符
+                    from PIL import Image, ImageDraw, ImageFont
+                    # 创建一个白色背景的图像
+                    img = Image.new('RGB', (800, 600), color='white')
+                    draw = ImageDraw.Draw(img)
+                    # 在图像上写入提示文本
+                    try:
+                        text = "文档OCR识别结果\n请根据文本内容提取字段"
+                        draw.text((50, 50), text, fill='black')
+                    except:
+                        pass
+                    image_for_api = img
+                
+                # 调用API进行信息抽取
+                api_result = self.doc_api.recognize_card(
+                    image=image_for_api,
+                    custom_prompt=effective_prompt,
+                    max_tokens=2048,
+                    temperature=0.2,
+                    top_p=0.8,
+                    use_rag=False
+                )
+                
+                if api_result.get("success", False):
+                    response = api_result.get("result", "")
+                    print(f"✅ 大模型调用成功，响应长度: {len(response)}")
+                    # 提取表格部分
+                    table_html = self._extract_table_from_response(response)
+                    print(f"✅ 表格提取完成")
+                    return table_html
+                else:
+                    error_msg = api_result.get("error", "调用失败")
+                    print(f"❌ 调用失败: {error_msg}")
+                    return f"❌ 调用失败: {error_msg}"
+            except Exception as api_error:
+                # 如果API调用失败，返回格式化的提示词结果
+                print(f"⚠️ 调用异常: {api_error}")
+                import traceback
+                print(traceback.format_exc())
+                return f"❌ 调用失败: {str(api_error)}"
+            
+        except Exception as e:
+            import traceback
+            return f"❌ 信息抽取失败: {str(e)}\n{traceback.format_exc()}"
+    
+    def _extract_table_from_response(self, response):
+        """
+        从大模型响应中提取表格，格式化为HTML表格（一个字段一行）
+        
+        Args:
+            response: 大模型的响应文本
+            
+        Returns:
+            HTML格式的表格
+        """
+        import re
+        import html
+        
+        # 清理响应文本，移除代码块标记
+        response = response.strip()
+        if response.startswith('```'):
+            # 移除代码块标记
+            lines = response.split('\n')
+            start_idx = 0
+            end_idx = len(lines)
+            for i, line in enumerate(lines):
+                if line.strip().startswith('```'):
+                    if i == 0:
+                        start_idx = 1
+                    else:
+                        end_idx = i
+                        break
+            response = '\n'.join(lines[start_idx:end_idx])
+        
+        # 尝试提取Markdown表格
+        # 匹配完整的表格结构：表头行 + 分隔行 + 数据行
+        all_lines = response.split('\n')
+        table_lines = []
+        in_table = False
+        header_line_idx = -1
+        separator_line_idx = -1
+        
+        # 查找表格开始位置
+        for i, line in enumerate(all_lines):
+            line_stripped = line.strip()
+            # 检查是否是表格行（包含 | 符号）
+            if '|' in line_stripped:
+                # 检查是否是分隔行（只包含 -、:、| 和空格）
+                if re.match(r'^[\s\|:\-]+$', line_stripped):
+                    if header_line_idx >= 0 and separator_line_idx < 0:
+                        # 找到分隔行
+                        separator_line_idx = i
+                        in_table = True
+                        continue
+                elif not in_table:
+                    # 可能是表头行
+                    header_line_idx = i
+                    table_lines.append(line_stripped)
+                elif in_table:
+                    # 数据行
+                    table_lines.append(line_stripped)
+            elif in_table:
+                # 表格结束
+                break
+        
+        # 如果找到了表格行，解析它们
+        if len(table_lines) > 1:
+            html_table = '<div style="margin: 20px 0;">\n'
+            html_table += '<table class="ocr-result-table" style="width: 100%; border-collapse: collapse; border: 1px solid #dee2e6; font-size: 14px;">\n'
+            html_table += '<thead><tr style="background: #f8f9fa; font-weight: 600;">'
+            html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 30%;">字段名</th>'
+            html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 70%;">字段值</th>'
+            html_table += '</tr></thead>\n<tbody>\n'
+            
+            # 解析表格行（跳过第一行表头，从数据行开始）
+            for line in table_lines[1:]:
+                # 跳过分隔行
+                if re.match(r'^[\s\|:\-]+$', line):
+                    continue
+                
+                # 分割单元格
+                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+                
+                # 如果单元格数量 >= 2，提取字段名和字段值
+                if len(cells) >= 2:
+                    # 第一个单元格是字段名，第二个是字段值
+                    field_name = cells[0].strip()
+                    field_value = cells[1].strip() if len(cells) > 1 else ""
+                    
+                    # 清理字段名和字段值（移除可能的标记符号）
+                    field_name = re.sub(r'^[-\*\s]+', '', field_name).strip()
+                    field_value = re.sub(r'^[-\*\s]+', '', field_value).strip()
+                    
+                    # 如果字段名不是"字段名"等表头关键词，才添加
+                    if field_name and field_name not in ['字段名', '字段值', 'Field Name', 'Field Value']:
+                        html_table += f'<tr>'
+                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; font-weight: 500; background: #fafbfc;">{html.escape(field_name)}</td>'
+                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; word-wrap: break-word;">{html.escape(field_value)}</td>'
+                        html_table += '</tr>\n'
+            
+            html_table += '</tbody></table>\n</div>'
+            return html_table
+        
+        # 如果没有找到标准表格，尝试提取字段名:字段值格式
+        lines = response.split('\n')
+        html_table = '<div style="margin: 20px 0;">\n'
+        html_table += '<table class="ocr-result-table" style="width: 100%; border-collapse: collapse; border: 1px solid #dee2e6; font-size: 14px;">\n'
+        html_table += '<thead><tr style="background: #f8f9fa; font-weight: 600;">'
+        html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 30%;">字段名</th>'
+        html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 70%;">字段值</th>'
+        html_table += '</tr></thead>\n<tbody>\n'
+        
+        found_rows = False
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # 跳过代码块标记和分隔行
+            if line.startswith('```') or re.match(r'^[\s\|:\-]+$', line):
+                continue
+            
+            # 尝试匹配字段名:字段值或字段名：字段值
+            if ':' in line or '：' in line:
+                parts = re.split('[:：]', line, 1)
+                if len(parts) == 2:
+                    field = parts[0].strip()
+                    value = parts[1].strip()
+                    # 清理字段名（移除可能的标记符号）
+                    field = re.sub(r'^[-\*\s]+', '', field).strip()
+                    value = re.sub(r'^[-\*\s]+', '', value).strip()
+                    if field and value:
+                        html_table += f'<tr>'
+                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; font-weight: 500; background: #fafbfc;">{html.escape(field)}</td>'
+                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; word-wrap: break-word;">{html.escape(value)}</td>'
+                        html_table += '</tr>\n'
+                        found_rows = True
+        
+        if not found_rows:
+            # 如果都没有找到，返回原始响应的前500字符
+            html_table += f'<tr><td colspan="2" style="border: 1px solid #dee2e6; padding: 12px; color: #dc3545;">⚠️ 无法解析响应格式，原始内容：<br/>{html.escape(response[:500])}</td></tr>\n'
+        
+        html_table += '</tbody></table>\n</div>'
+        return html_table
 
     def spatial_analysis(self, image, prompt: str = None):
         """空间感知分析，可选自定义提示词"""
@@ -4759,7 +5627,8 @@ def create_unified_interface():
                         gr.update(visible=False),
                         gr.update(visible=False),
                         gr.update(visible=False),
-                        gr.update(visible=False)
+                        gr.update(visible=False),
+                        gr.update(visible=False, value="")
                     )
                 
                 fields_list = []
@@ -4773,7 +5642,8 @@ def create_unified_interface():
                         gr.update(visible=False),
                         gr.update(visible=False),
                         gr.update(visible=False),
-                        gr.update(visible=False)
+                        gr.update(visible=False),
+                        gr.update(visible=False, value="")
                     )
                 
                 result = app.ocr_bill_with_fields(image, fields_list)
@@ -4797,7 +5667,7 @@ def create_unified_interface():
                         gr.update(visible=False, value=""),
                         gr.update(visible=False),
                         gr.update(visible=False),
-                        gr.update(visible=False)
+                        gr.update(visible=False, value="")
                     )
             
             # 导出票据OCR结果
@@ -5122,6 +5992,498 @@ def create_unified_interface():
                 export_with_js_content,
                 inputs=[bill_ocr_result_html_edited, bill_ocr_export_format],
                 outputs=[bill_ocr_export_status_3step]
+            )
+
+        with gr.Tab("📚 文档OCR识别"):
+            gr.Markdown("### 完整流程：文档输入 → 文本检测 → 文本识别（全文） → 布局分析（Layout） → 字段提取（KIE） → 输出结构化数据")
+            gr.Markdown("**支持格式：** 图片（JPG/PNG等）和PDF文档")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    doc_file = gr.File(
+                        label="上传文档（支持图片和PDF）",
+                        file_types=[".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".webp"],
+                        height=100
+                    )
+                    
+                    doc_pdf_pages = gr.Textbox(
+                        label="PDF页码（可选，留空处理所有页，如：1,3,5）",
+                        placeholder="留空处理所有页，或输入页码如：1,3,5",
+                        visible=False
+                    )
+                    
+                    doc_custom_prompt = gr.Textbox(
+                        label="自定义提示词（可选）",
+                        placeholder="留空使用默认提示词",
+                        lines=3,
+                        interactive=True
+                    )
+                    
+                    with gr.Row():
+                        doc_ocr_btn = gr.Button("🚀 开始文档OCR识别", variant="primary")
+                
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        gr.Markdown("### 📊 OCR识别结果")
+                        with gr.Column(scale=1, min_width=200):
+                            doc_ocr_export_format = gr.Dropdown(
+                                choices=["Markdown (.md)", "Excel (.xlsx)", "CSV (.csv)", "JSON (.json)"],
+                                value="Markdown (.md)",
+                                label="导出格式",
+                                visible=False
+                            )
+                        doc_ocr_export_btn = gr.Button("💾 导出结果", variant="secondary", visible=False, size="sm")
+                    
+                    # 分页控制
+                    with gr.Row(visible=False) as doc_page_controls:
+                        doc_page_prev_btn = gr.Button("⬅️ 上一页", variant="secondary", size="sm")
+                        doc_page_info = gr.Markdown("第 1 页 / 共 1 页", elem_id="doc-page-info")
+                        doc_page_next_btn = gr.Button("下一页 ➡️", variant="secondary", size="sm")
+                    
+                    doc_ocr_result_html = gr.HTML(
+                        label="OCR识别结果",
+                        visible=False,
+                        elem_id="doc-ocr-result-html"
+                    )
+                    
+                    # 关键字段输入和信息抽取（OCR识别完成后显示）
+                    with gr.Row(visible=False) as doc_extract_controls:
+                        with gr.Column():
+                            gr.Markdown("### 🔍 关键字段识别")
+                            doc_key_fields = gr.Textbox(
+                                label="关键字段（每行一个，用于RAG相似度映射）",
+                                placeholder="例如：\n合同编号\n甲方\n乙方\n签订日期",
+                                lines=5,
+                                interactive=True
+                            )
+                            doc_extract_btn = gr.Button("🔍 识别关键字段", variant="primary")
+                    
+                    doc_extract_result = gr.HTML(
+                        label="信息抽取结果",
+                        visible=False,
+                        elem_id="doc-extract-result"
+                    )
+                    
+                    doc_ocr_export_status = gr.Textbox(
+                        label="导出状态",
+                        interactive=False,
+                        visible=False,
+                        lines=3
+                    )
+            
+            # 文件上传变化时，更新UI显示
+            def on_file_change(file):
+                if file is None:
+                    return (
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+                
+                file_path = file.name if hasattr(file, 'name') else file
+                file_ext = os.path.splitext(file_path)[1].lower()
+                
+                if file_ext == '.pdf':
+                    return (
+                        gr.update(visible=False),
+                        gr.update(visible=True),
+                        gr.update(value="")
+                    )
+                else:
+                    return (
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+            
+            # 文档OCR识别处理函数
+            def process_doc_ocr(file, pdf_pages, custom_prompt):
+                print(f"[DEBUG] process_doc_ocr 被调用")
+                print(f"[DEBUG] file: {file}, pdf_pages: {pdf_pages}")
+                
+                try:
+                    # 优先使用文件上传
+                    if file is not None:
+                        file_path = file.name if hasattr(file, 'name') else file
+                        print(f"[DEBUG] 文件路径: {file_path}")
+                        
+                        if not file_path:
+                            error_msg = "❌ 请上传文档文件或图片！"
+                            print(f"[DEBUG] {error_msg}")
+                            return (
+                                gr.update(visible=False),
+                                gr.update(visible=False),  # 分页控件
+                                gr.update(visible=False),  # 导出格式
+                                gr.update(visible=False),  # 导出按钮
+                                gr.update(visible=False),  # 信息抽取控件
+                                gr.update(visible=True, value=error_msg),
+                                error_msg
+                            )
+                        
+                        if not os.path.exists(file_path):
+                            error_msg = f"❌ 文件不存在: {file_path}"
+                            print(f"[DEBUG] {error_msg}")
+                            return (
+                                gr.update(visible=False),
+                                gr.update(visible=False),  # 分页控件
+                                gr.update(visible=False),  # 导出格式
+                                gr.update(visible=False),  # 导出按钮
+                                gr.update(visible=False),  # 信息抽取控件
+                                gr.update(visible=True, value=error_msg),
+                                error_msg
+                            )
+                        
+                        file_ext = os.path.splitext(file_path)[1].lower()
+                        print(f"[DEBUG] 文件扩展名: {file_ext}")
+                        
+                        if file_ext == '.pdf':
+                            # 处理PDF
+                            print("[DEBUG] 开始处理PDF...")
+                            try:
+                                with open(file_path, 'rb') as f:
+                                    pdf_bytes = f.read()
+                                print(f"[DEBUG] PDF文件大小: {len(pdf_bytes)} 字节")
+                                result = app.ocr_document(
+                                    pdf_bytes, 
+                                    custom_prompt if custom_prompt and custom_prompt.strip() else None,
+                                    is_pdf=True,
+                                    pdf_pages=pdf_pages if pdf_pages and pdf_pages.strip() else "all"
+                                )
+                                print(f"[DEBUG] PDF处理完成，结果长度: {len(result) if result else 0}")
+                            except Exception as e:
+                                import traceback
+                                error_msg = f"❌ PDF处理失败: {str(e)}"
+                                print(f"[DEBUG] PDF处理异常: {traceback.format_exc()}")
+                                return (
+                                    gr.update(visible=False),
+                                    gr.update(visible=False),  # 分页控件
+                                    gr.update(visible=False),  # 导出格式
+                                    gr.update(visible=False),  # 导出按钮
+                                    gr.update(visible=False),  # 信息抽取控件
+                                    gr.update(visible=True, value=error_msg),
+                                    error_msg
+                                )
+                        else:
+                            # 处理图片文件
+                            print("[DEBUG] 开始处理图片文件...")
+                            try:
+                                from PIL import Image
+                                img = Image.open(file_path).convert("RGB")
+                                print(f"[DEBUG] 图片尺寸: {img.size}")
+                                result = app.ocr_document(img, custom_prompt if custom_prompt and custom_prompt.strip() else None)
+                                print(f"[DEBUG] 图片处理完成，结果长度: {len(result) if result else 0}")
+                            except Exception as e:
+                                import traceback
+                                error_msg = f"❌ 图片处理失败: {str(e)}"
+                                print(f"[DEBUG] 图片处理异常: {traceback.format_exc()}")
+                                return (
+                                    gr.update(visible=False),
+                                    gr.update(visible=False),  # 分页控件
+                                    gr.update(visible=False),  # 导出格式
+                                    gr.update(visible=False),  # 导出按钮
+                                    gr.update(visible=False),  # 信息抽取控件
+                                    gr.update(visible=True, value=error_msg),
+                                    error_msg
+                                )
+                    else:
+                        error_msg = "❌ 请上传文档文件！"
+                        print(f"[DEBUG] {error_msg}")
+                        return (
+                            gr.update(visible=False),
+                            gr.update(visible=False),  # 分页控件
+                            gr.update(visible=False),  # 导出格式
+                            gr.update(visible=False),  # 导出按钮
+                            gr.update(visible=False),  # 信息抽取控件
+                            gr.update(visible=True, value=error_msg),
+                            error_msg
+                        )
+                    
+                    if result is None:
+                        error_msg = "❌ 处理失败，未返回结果"
+                        print(f"[DEBUG] {error_msg}")
+                        return (
+                            gr.update(visible=False),
+                            gr.update(visible=False),  # 分页控件
+                            gr.update(visible=False),  # 导出格式
+                            gr.update(visible=False),  # 导出按钮
+                            gr.update(visible=False),  # 信息抽取控件
+                            gr.update(visible=True, value=error_msg),
+                            error_msg
+                        )
+                    
+                    if result.startswith("❌"):
+                        print(f"[DEBUG] 处理失败: {result}")
+                        return (
+                            gr.update(visible=False),
+                            gr.update(visible=False),  # 分页控件
+                            gr.update(visible=False),  # 导出格式
+                            gr.update(visible=False),  # 导出按钮
+                            gr.update(visible=False),  # 信息抽取控件
+                            gr.update(visible=True, value=result),
+                            result
+                        )
+                    
+                    print("[DEBUG] 准备返回结果...")
+                    # 获取第一页的文本用于显示
+                    page_texts = getattr(app, 'last_ocr_page_texts', [])
+                    if page_texts:
+                        # 显示第一页
+                        first_page_text = page_texts[0]
+                        page_count = len(page_texts)
+                        page_html = f"""
+                        <div style="padding: 20px; background: #f8f9fa; border-radius: 8px;">
+                            <h3>第 1 页 / 共 {page_count} 页</h3>
+                            <div style="background: white; padding: 15px; border-radius: 6px; margin-top: 10px; white-space: pre-wrap; font-family: monospace; max-height: 600px; overflow-y: auto;">
+                                {html.escape(first_page_text)}
+                            </div>
+                        </div>
+                        """
+                    else:
+                        page_html = app.last_ocr_html or _plain_text_to_html(app.last_ocr_markdown or "")
+                    
+                    print(f"[DEBUG] HTML长度: {len(page_html) if page_html else 0}, 页数: {len(page_texts) if page_texts else 0}")
+                    
+                    # 如果有多个页面，显示分页控件
+                    show_page_controls = len(page_texts) > 1
+                    # 关键字段输入框在OCR识别完成后就显示（不依赖页数）
+                    show_extract_controls = True
+                    
+                    return (
+                        gr.update(value=page_html, visible=True),
+                        gr.update(visible=show_page_controls),  # 分页控件
+                        gr.update(visible=True),  # 导出格式
+                        gr.update(visible=True),  # 导出按钮
+                        gr.update(visible=show_extract_controls),  # 信息抽取控件（关键字段输入）
+                        gr.update(visible=True, value="✅ 文档OCR识别完成，可导出结果"),
+                        "✅ 文档OCR识别完成，可导出结果"
+                    )
+                except Exception as e:
+                    import traceback
+                    error_msg = f"❌ 处理失败: {str(e)}"
+                    print(f"[DEBUG] 异常: {traceback.format_exc()}")
+                    return (
+                        gr.update(visible=False),
+                        gr.update(visible=False),  # 分页控件
+                        gr.update(visible=False),  # 导出格式
+                        gr.update(visible=False),  # 导出按钮
+                        gr.update(visible=False),  # 信息抽取控件
+                        gr.update(visible=True, value=error_msg),
+                        error_msg
+                    )
+            
+            # 文件上传变化时，更新UI显示（文档OCR）
+            def on_file_change(file):
+                if file is None:
+                    return (
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+                
+                file_path = file.name if hasattr(file, 'name') else file
+                file_ext = os.path.splitext(file_path)[1].lower()
+                
+                if file_ext == '.pdf':
+                    return (
+                        gr.update(visible=True),
+                        gr.update(value="")
+                    )
+                else:
+                    return (
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+            
+            # 分页切换函数
+            def change_doc_page(direction):
+                """切换文档页面（direction: 'prev' 或 'next'）"""
+                page_texts = getattr(app, 'last_ocr_page_texts', [])
+                if not page_texts:
+                    return (
+                        gr.update(value="❌ 没有可显示的页面", visible=True),
+                        gr.update(value="第 0 页 / 共 0 页"),
+                        gr.update(),
+                        gr.update()
+                    )
+                
+                # 从页面信息中获取当前页码（使用隐藏状态）
+                current_page = getattr(app, '_current_doc_page', 0)
+                
+                if direction == 'prev':
+                    current_page = max(0, current_page - 1)
+                elif direction == 'next':
+                    current_page = min(len(page_texts) - 1, current_page + 1)
+                
+                app._current_doc_page = current_page
+                page_count = len(page_texts)
+                page_text = page_texts[current_page]
+                
+                page_html = f"""
+                <div style="padding: 20px; background: #f8f9fa; border-radius: 8px;">
+                    <h3>第 {current_page + 1} 页 / 共 {page_count} 页</h3>
+                    <div style="background: white; padding: 15px; border-radius: 6px; margin-top: 10px; white-space: pre-wrap; font-family: monospace; max-height: 600px; overflow-y: auto;">
+                        {html.escape(page_text)}
+                    </div>
+                </div>
+                """
+                
+                page_info = f"第 {current_page + 1} 页 / 共 {page_count} 页"
+                
+                return (
+                    gr.update(value=page_html, visible=True),
+                    gr.update(value=page_info),
+                    gr.update(interactive=current_page > 0),  # 上一页按钮
+                    gr.update(interactive=current_page < page_count - 1)  # 下一页按钮
+                )
+            
+            # 信息抽取函数
+            def extract_doc_fields(key_fields_text):
+                """根据关键字段进行信息抽取，返回表格格式"""
+                if not key_fields_text or not key_fields_text.strip():
+                    return gr.update(value="❌ 请输入关键字段", visible=True)
+                
+                # 解析关键字段（每行一个）
+                key_fields = [f.strip() for f in key_fields_text.strip().split('\n') if f.strip()]
+                
+                if not key_fields:
+                    return gr.update(value="❌ 关键字段列表为空", visible=True)
+                
+                try:
+                    result = app.extract_document_fields_with_rag(key_fields)
+                    # 如果结果是HTML表格，直接使用；否则转换为HTML
+                    if result.startswith('<table') or result.startswith('<div'):
+                        result_html = result
+                    else:
+                        # 检查是否包含表格
+                        if '<table' in result:
+                            result_html = result
+                        else:
+                            result_html = _plain_text_to_html(result)
+                    return gr.update(value=result_html, visible=True)
+                except Exception as e:
+                    import traceback
+                    error_msg = f"❌ 信息抽取失败: {str(e)}\n{traceback.format_exc()}"
+                    return gr.update(value=_plain_text_to_html(error_msg), visible=True)
+            
+            doc_file.change(
+                on_file_change,
+                inputs=[doc_file],
+                outputs=[doc_pdf_pages, doc_pdf_pages]
+            )
+            
+            # 绑定分页按钮事件
+            doc_page_prev_btn.click(
+                lambda: change_doc_page('prev'),
+                outputs=[doc_ocr_result_html, doc_page_info, doc_page_prev_btn, doc_page_next_btn]
+            )
+            
+            doc_page_next_btn.click(
+                lambda: change_doc_page('next'),
+                outputs=[doc_ocr_result_html, doc_page_info, doc_page_prev_btn, doc_page_next_btn]
+            )
+            
+            # 绑定信息抽取按钮事件
+            doc_extract_btn.click(
+                extract_doc_fields,
+                inputs=[doc_key_fields],
+                outputs=[doc_extract_result]
+            )
+            
+            # 导出文档OCR结果
+            def export_doc_ocr_result(export_format):
+                if not app.last_ocr_markdown:
+                    return gr.update(visible=True, value="❌ 没有可导出的结果！")
+                
+                try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    export_dir = "ocr_exports"
+                    os.makedirs(export_dir, exist_ok=True)
+                    
+                    if export_format == "Markdown (.md)":
+                        file_name = f"doc_ocr_{timestamp}.md"
+                        file_path = os.path.join(export_dir, file_name)
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(app.last_ocr_markdown)
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Markdown文件已保存到:\n{abs_file_path}")
+                    elif export_format == "Excel (.xlsx)":
+                        # 从Markdown中提取表格数据
+                        import pandas as pd
+                        lines = app.last_ocr_markdown.split('\n')
+                        table_data = []
+                        for line in lines:
+                            if '|' in line and '---' not in line:
+                                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+                                if len(cells) >= 2:
+                                    table_data.append(cells[:2])
+                        
+                        if table_data:
+                            df = pd.DataFrame(table_data, columns=["字段名", "字段值"])
+                        else:
+                            df = pd.DataFrame([["内容", app.last_ocr_markdown[:500]]], columns=["字段名", "字段值"])
+                        
+                        file_name = f"doc_ocr_{timestamp}.xlsx"
+                        file_path = os.path.join(export_dir, file_name)
+                        df.to_excel(file_path, index=False)
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Excel文件已保存到:\n{abs_file_path}")
+                    elif export_format == "CSV (.csv)":
+                        import pandas as pd
+                        lines = app.last_ocr_markdown.split('\n')
+                        table_data = []
+                        for line in lines:
+                            if '|' in line and '---' not in line:
+                                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+                                if len(cells) >= 2:
+                                    table_data.append(cells[:2])
+                        
+                        if table_data:
+                            df = pd.DataFrame(table_data, columns=["字段名", "字段值"])
+                        else:
+                            df = pd.DataFrame([["内容", app.last_ocr_markdown[:500]]], columns=["字段名", "字段值"])
+                        
+                        file_name = f"doc_ocr_{timestamp}.csv"
+                        file_path = os.path.join(export_dir, file_name)
+                        df.to_csv(file_path, index=False, encoding='utf-8-sig')
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 CSV文件已保存到:\n{abs_file_path}")
+                    elif export_format == "JSON (.json)":
+                        import json
+                        data = {}
+                        lines = app.last_ocr_markdown.split('\n')
+                        for line in lines:
+                            if '|' in line and '---' not in line:
+                                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+                                if len(cells) >= 2:
+                                    data[cells[0]] = cells[1]
+                        
+                        if not data:
+                            data = {"内容": app.last_ocr_markdown[:500]}
+                        
+                        file_name = f"doc_ocr_{timestamp}.json"
+                        file_path = os.path.join(export_dir, file_name)
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 JSON文件已保存到:\n{abs_file_path}")
+                    else:
+                        return gr.update(visible=True, value=f"❌ 不支持的导出格式: {export_format}")
+                except Exception as e:
+                    import traceback
+                    error_msg = f"❌ 导出失败: {str(e)}\n{traceback.format_exc()}"
+                    print(error_msg)
+                    return gr.update(visible=True, value=error_msg)
+            
+            doc_ocr_btn.click(
+                process_doc_ocr,
+                inputs=[doc_file, doc_pdf_pages, doc_custom_prompt],
+                outputs=[doc_ocr_result_html, doc_page_controls, doc_ocr_export_format, doc_ocr_export_btn, doc_extract_controls, doc_ocr_export_status, doc_ocr_export_status],
+                show_progress=True
+            )
+            
+            doc_ocr_export_btn.click(
+                export_doc_ocr_result,
+                inputs=[doc_ocr_export_format],
+                outputs=[doc_ocr_export_status]
             )
 
         with gr.Tab("ℹ️ 使用说明"):
