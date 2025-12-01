@@ -15,6 +15,7 @@ import hashlib
 import time
 import csv
 import html
+import re
 import numpy as np
 from datetime import datetime
 import shutil
@@ -2888,8 +2889,136 @@ class AdvancedQwen3VLApp:
         
         return None
     
+
     PADDLEOCR_API_URL = "https://wdc9jbw9l1f8996b.aistudio-app.com/ocr"
     PADDLEOCR_TOKEN = "61236296494fb5e32ee89aef50d4d6aa99fa2ba7"
+
+    def _parse_pdf_page_spec(self, pages_spec: str, total_pages: int):
+        """
+        解析用户输入的页码字符串，支持格式：
+        - 逗号分隔页码：1,3,5
+        - 区间：2-4
+        - 混合输入与空格
+        返回去重且排序后的页码列表（1-based）
+        """
+        if not pages_spec or not pages_spec.strip():
+            return []
+
+        normalized = (
+            pages_spec.replace("，", ",")
+            .replace("、", ",")
+            .replace(";", ",")
+            .strip()
+        )
+        if not normalized:
+            return []
+
+        tokens = re.split(r"[,\s]+", normalized)
+        selected_pages = set()
+
+        for token in tokens:
+            if not token:
+                continue
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                parts = token.split("-", 1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    start = int(parts[0])
+                    end = int(parts[1])
+                except ValueError:
+                    continue
+                if start > end:
+                    start, end = end, start
+                for page in range(start, end + 1):
+                    if 1 <= page <= total_pages:
+                        selected_pages.add(page)
+            else:
+                try:
+                    page = int(token)
+                except ValueError:
+                    continue
+                if 1 <= page <= total_pages:
+                    selected_pages.add(page)
+
+        return sorted(selected_pages)
+
+    def _filter_pdf_pages(self, pdf_path: str, pages_spec: str):
+        """
+        根据页码过滤PDF页面，只返回包含指定页的新PDF路径。
+        如果解析失败或依赖缺失则返回None。
+        """
+        if not os.path.exists(pdf_path):
+            return None
+
+        pages_spec = pages_spec or ""
+        if pages_spec.strip().lower() == "all":
+            return None
+
+        # 优先使用 PyMuPDF，失败后再尝试 PyPDF2
+        if PYMUPDF_AVAILABLE:
+            try:
+                import fitz
+
+                src_doc = fitz.open(pdf_path)
+                total_pages = src_doc.page_count
+                selected_pages = self._parse_pdf_page_spec(pages_spec, total_pages)
+
+                if not selected_pages:
+                    print("⚠️ PDF页码解析为空，继续识别全部页面")
+                    return None
+
+                filtered_doc = fitz.open()
+                for page_num in selected_pages:
+                    filtered_doc.insert_pdf(
+                        src_doc, from_page=page_num - 1, to_page=page_num - 1
+                    )
+
+                temp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+                temp_pdf_path = temp_pdf.name
+                temp_pdf.close()
+                filtered_doc.save(temp_pdf_path)
+                filtered_doc.close()
+                src_doc.close()
+                print(f"✅ 使用PyMuPDF 过滤PDF页面: {selected_pages}")
+                return temp_pdf_path
+            except Exception as e:
+                print(f"⚠️ 使用PyMuPDF过滤PDF失败: {e}")
+
+        try:
+            from PyPDF2 import PdfReader, PdfWriter
+        except ImportError:
+            print("⚠️ 未安装PyPDF2，无法按页裁剪PDF，继续识别全部页面")
+            return None
+
+        try:
+            reader = PdfReader(pdf_path)
+            total_pages = len(reader.pages)
+            selected_pages = self._parse_pdf_page_spec(pages_spec, total_pages)
+
+            if not selected_pages:
+                print("⚠️ PDF页码解析为空，继续识别全部页面")
+                return None
+
+            writer = PdfWriter()
+            for page_num in selected_pages:
+                writer.add_page(reader.pages[page_num - 1])
+
+            temp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            temp_pdf_path = temp_pdf.name
+            temp_pdf.close()
+            with open(temp_pdf_path, "wb") as output_pdf:
+                writer.write(output_pdf)
+
+            print(f"✅ 使用PyPDF2 过滤PDF页面: {selected_pages}")
+            return temp_pdf_path
+        except Exception as e:
+            print(f"⚠️ 使用PyPDF2过滤PDF失败: {e}")
+            return None
+
 
     def ocr_document(self, image_or_file, prompt: str = None, is_pdf: bool = False, pdf_pages: str = "all"):
         """
@@ -2912,33 +3041,48 @@ class AdvancedQwen3VLApp:
         import tempfile
         
         try:
+            # 记录临时文件列表，便于统一清理
+            temp_files = []
+
             # 确定文件路径或处理字节数据
-            is_temp = False
             file_path = None
             
             if isinstance(image_or_file, Image.Image):
                 # 如果是 PIL Image，需要先保存为临时文件
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    image_or_file.save(tmp.name, 'PNG')
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    image_or_file.save(tmp.name, "PNG")
                     file_path = tmp.name
-                    is_temp = True
+                    temp_files.append(tmp.name)
             elif isinstance(image_or_file, str):
                 # 如果是文件路径
                 file_path = image_or_file
-                is_temp = False
             elif isinstance(image_or_file, bytes):
                 # 如果是字节数据（PDF或图片的字节流）
                 # 根据 is_pdf 参数确定文件扩展名
-                suffix = '.pdf' if is_pdf else '.png'
+                suffix = ".pdf" if is_pdf else ".png"
                 with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                     tmp.write(image_or_file)
                     file_path = tmp.name
-                    is_temp = True
+                    temp_files.append(tmp.name)
             else:
                 return "❌ 不支持的文件类型（需要 PIL Image、文件路径或字节数据）"
             
             if not file_path or not os.path.exists(file_path):
                 return f"❌ 文件不存在: {file_path}"
+
+            # 如果是PDF且指定了页码，则尝试裁剪PDF
+            if (
+                (is_pdf or file_path.lower().endswith(".pdf"))
+                and pdf_pages
+                and pdf_pages.strip()
+                and pdf_pages.strip().lower() != "all"
+            ):
+                filtered_pdf = self._filter_pdf_pages(file_path, pdf_pages)
+                if filtered_pdf:
+                    file_path = filtered_pdf
+                    temp_files.append(filtered_pdf)
+                else:
+                    print("⚠️ 未能按页码裁剪PDF，继续识别全部页面")
             
             # 创建输出目录（用于保存OCR结果，准备RAG切片）
             output_dir = "ocr_output"
@@ -2955,7 +3099,7 @@ class AdvancedQwen3VLApp:
             
             # 准备请求
             headers = {
-                "Authorization": f"token {PADDLEOCR_TOKEN}",
+                "Authorization": f"token {self.PADDLEOCR_TOKEN}",
                 "Content-Type": "application/json"
             }
             
@@ -2980,7 +3124,7 @@ class AdvancedQwen3VLApp:
             # 根据文件大小设置超时
             timeout = max(600, int(file_size_mb * 60))
             
-            response = requests.post(PADDLEOCR_API_URL, json=payload, headers=headers, timeout=timeout)
+            response = requests.post(self.PADDLEOCR_API_URL, json=payload, headers=headers, timeout=timeout)
             
             elapsed_time = time.time() - start_time
             print(f"响应时间: {elapsed_time:.2f}秒")
@@ -3108,13 +3252,6 @@ class AdvancedQwen3VLApp:
                 'json': json_file
             }
             
-            # 清理临时文件
-            if is_temp and os.path.exists(file_path):
-                try:
-                    os.unlink(file_path)
-                except:
-                    pass
-            
             self.last_ocr_html = "<h2>文档OCR识别结果</h2>" + self._render_sections_as_html(result_markdown)
             
             # 在后台进行文本切片（不阻塞返回）
@@ -3148,6 +3285,13 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             import traceback
             return f"❌ 处理过程中出现错误: {e}\n{traceback.format_exc()}"
+        finally:
+            for tmp_path in temp_files:
+                try:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except:
+                    pass
     
     def extract_document_fields_with_rag(self, key_fields, custom_prompt=None):
         """
