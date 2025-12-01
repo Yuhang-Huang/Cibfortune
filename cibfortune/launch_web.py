@@ -74,26 +74,32 @@ def install_missing_deps():
 
 def check_model():
     """检查模型"""
-    # model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
-    model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
+# <<<<<<< HEAD
+#     # model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+#     model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
+# =======
+#     pwd = os.getcwd()
+#     model_path = os.path.join(pwd, "models", "qwen3-vl-2b-instruct")
     
-    print(f"🔍 检查模型路径: {model_path}")
+# >>>>>>> 73ca73e (feat: 支持其他类型单据识别生成表格)
     
-    if not os.path.exists(model_path):
-        print(f"❌ 模型路径不存在: {model_path}")
-        return False
+#     print(f"🔍 检查模型路径: {model_path}")
     
-    # 检查关键文件
-    required_files = ["config.json", "tokenizer_config.json"]
-    missing_files = []
+#     if not os.path.exists(model_path):
+#         print(f"❌ 模型路径不存在: {model_path}")
+#         return False
     
-    for file in required_files:
-        if not os.path.exists(os.path.join(model_path, file)):
-            missing_files.append(file)
+#     # 检查关键文件
+#     required_files = ["config.json", "tokenizer_config.json"]
+#     missing_files = []
     
-    if missing_files:
-        print(f"❌ 模型文件不完整，缺少: {', '.join(missing_files)}")
-        return False
+#     for file in required_files:
+#         if not os.path.exists(os.path.join(model_path, file)):
+#             missing_files.append(file)
+    
+#     if missing_files:
+#         print(f"❌ 模型文件不完整，缺少: {', '.join(missing_files)}")
+#         return False
     
     print("✅ 模型检查通过")
     return True
