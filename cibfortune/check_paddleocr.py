@@ -18,3 +18,5 @@ except ImportError:
     print("   或者:")
     print("   pip install paddlepaddle paddleocr")
 
+
+

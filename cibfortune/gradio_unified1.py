@@ -20,15 +20,15 @@ from datetime import datetime
 import shutil
 import atexit
 import gc
+import tempfile
+import cv2
 
 import gradio as gr
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from ocr_card_rag_api import CardOCRWithRAG
 from PIL import Image
+from image import paddleocr_super_resolution
 
-# PaddleOCR API 配置（使用 API 调用，不需要本地安装 PaddleOCR）
-PADDLEOCR_API_URL = "https://wdc9jbw9l1f8996b.aistudio-app.com/ocr"
-PADDLEOCR_TOKEN = "61236296494fb5e32ee89aef50d4d6aa99fa2ba7"
 
 # 尝试导入PDF处理库
 PDF_AVAILABLE = False
@@ -75,7 +75,7 @@ class AdvancedQwen3VLApp:
     def __init__(self):
         self.model = None
         self.processor = None
-        self.model_path = "\D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+        self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
         self.is_loaded = False
         self.chat_history = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -109,6 +109,73 @@ class AdvancedQwen3VLApp:
         self.current_custom_fields = []
         self.current_field_template_html = None  # 存储HTML表格结构
         self.current_final_fields_html = None  # 存储最终字段列表的HTML（包含自定义字段）
+
+    def _super_resolve_image_for_ocr(self, image):
+        """
+        使用 image.py 中的双三次插值函数对图像进行超分辨率处理，
+        在提供给大模型前尽可能提升清晰度。
+        兼容 PIL.Image 和 numpy.ndarray 输入，失败时回退为原图。
+        """
+        if image is None:
+            return None
+
+        try:
+            # 统一转换为 PIL.Image
+            if isinstance(image, Image.Image):
+                pil_img = image
+            else:
+                try:
+                    pil_img = Image.fromarray(np.array(image))
+                except Exception:
+                    # 无法转换时直接返回原始输入
+                    return image
+
+            # 将图像暂存为临时文件，复用 image.py 中的 paddleocr_super_resolution 逻辑
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                tmp_in = f.name
+                pil_img.save(tmp_in, format="PNG")
+
+            tmp_out = tmp_in.replace(".png", "_sr.png")
+
+            try:
+                upscaled = paddleocr_super_resolution(
+                    tmp_in,
+                    output_path=tmp_out,
+                )
+            except Exception as e:
+                print(f"⚠️ 超分辨率处理失败，使用原图: {e}")
+                return pil_img
+            finally:
+                # 清理输入临时文件（输出文件可能供排查使用，先不强制删除）
+                try:
+                    if os.path.exists(tmp_in):
+                        os.remove(tmp_in)
+                except Exception:
+                    pass
+
+            if upscaled is None:
+                # 处理失败时直接返回原图
+                return pil_img
+
+            # image.py 返回的是 OpenCV BGR 格式的 ndarray
+            if isinstance(upscaled, np.ndarray):
+                try:
+                    upscaled_rgb = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
+                    return Image.fromarray(upscaled_rgb)
+                except Exception as e:
+                    print(f"⚠️ 转换超分图像为PIL失败，使用原图: {e}")
+                    return pil_img
+
+            # 如果未来 paddleocr_super_resolution 直接返回 PIL.Image，也能兼容
+            if isinstance(upscaled, Image.Image):
+                return upscaled
+
+            # 其他未知类型，回退为原图
+            return pil_img
+
+        except Exception as e:
+            print(f"⚠️ 超分辨率预处理异常，使用原图: {e}")
+            return image
 
     def _ensure_card_rag_loaded(self):
         """懒加载卡证RAG图片库（若存在 rag_cards 目录），支持多种RAG实现方式。"""
@@ -628,6 +695,9 @@ class AdvancedQwen3VLApp:
             return None, [], "❌ 请先上传图片"
         
         try:
+            # 在提供给大模型前先做一次超分辨率预处理
+            image_sr = self._super_resolve_image_for_ocr(image)
+
             self._ensure_card_api_loaded()
             if self.card_api is None:
                 return None, [], "❌ 卡证OCR 未初始化"
@@ -640,7 +710,7 @@ class AdvancedQwen3VLApp:
             )
             
             result = self.card_api.recognize_card(
-                image,
+                image_sr,
                 custom_prompt=type_prompt,
                 use_rag=False,
                 max_tokens=50,
@@ -691,6 +761,9 @@ class AdvancedQwen3VLApp:
             return None, [], None, "❌ 请先上传图片"
         
         try:
+            # 在提供给大模型前先做一次超分辨率预处理
+            image_sr = self._super_resolve_image_for_ocr(image)
+
             self._ensure_bill_api_loaded()
             if self.bill_api is None:
                 return None, [], None, "❌ 票据OCR 未初始化"
@@ -704,7 +777,7 @@ class AdvancedQwen3VLApp:
             )
             
             result = self.bill_api.recognize_card(
-                image,
+                image_sr,
                 custom_prompt=type_prompt,
                 use_rag=False,
                 max_tokens=50,
@@ -779,6 +852,9 @@ class AdvancedQwen3VLApp:
             return "❌ 请先设置要提取的字段"
         
         try:
+            # 在提供给大模型前先做一次超分辨率预处理
+            image_sr = self._super_resolve_image_for_ocr(image)
+
             self._ensure_card_api_loaded()
             if self.card_api is None:
                 return "❌ 卡证OCR 未初始化"
@@ -829,7 +905,7 @@ class AdvancedQwen3VLApp:
             use_rag = (self.current_card_type == "银行卡")
             
             result = self.card_api.recognize_card(
-                image,
+                image_sr,
                 custom_prompt=custom_prompt,
                 use_rag=use_rag,
             )
@@ -1256,6 +1332,9 @@ class AdvancedQwen3VLApp:
             return "❌ 请先设置要提取的字段"
         
         try:
+            # 在提供给大模型前先做一次超分辨率预处理
+            image_sr = self._super_resolve_image_for_ocr(image)
+
             self._ensure_bill_api_loaded()
             if self.bill_api is None:
                 return "❌ 票据OCR 未初始化"
@@ -1326,7 +1405,7 @@ class AdvancedQwen3VLApp:
             max_tokens = max(2048, min(estimated_tokens, 8192))  # 最小2048，最大8192
             
             result = self.bill_api.recognize_card(
-                image,
+                image_sr,
                 custom_prompt=custom_prompt,
                 use_rag=use_rag,
                 max_tokens=max_tokens,
@@ -2772,6 +2851,9 @@ class AdvancedQwen3VLApp:
                 return None
         
         return None
+    
+    PADDLEOCR_API_URL = "https://wdc9jbw9l1f8996b.aistudio-app.com/ocr"
+    PADDLEOCR_TOKEN = "61236296494fb5e32ee89aef50d4d6aa99fa2ba7"
 
     def ocr_document(self, image_or_file, prompt: str = None, is_pdf: bool = False, pdf_pages: str = "all"):
         """
