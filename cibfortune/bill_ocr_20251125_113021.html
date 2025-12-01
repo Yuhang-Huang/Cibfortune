@@ -1,0 +1,121 @@
+
+                <!DOCTYPE html>
+                <html lang="zh-CN">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>OCR 识别结果预览</title>
+                    <style>
+                        body {
+                            font-family: "Microsoft YaHei", Arial, sans-serif;
+                            padding: 40px;
+                            background-color: #f4f4f4;
+                            display: flex;
+                            justify-content: center;
+                        }
+                        
+                        /* 表格容器样式 */
+                        .table-container {
+                            background-color: white;
+                            padding: 20px;
+                            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                            border-radius: 8px;
+                            overflow-x: auto; /* 防止表格过宽溢出 */
+                        }
+
+                        /* 核心表格样式 */
+                        table.ocr-result-table {
+                            border-collapse: collapse; /* 合并边框，必须有 */
+                            margin: 0 auto;
+                            /* 如果你想覆盖原始的 width，可以在这里加 !important，否则保留原始宽度 */
+                        }
+
+                        /* 单元格样式 */
+                        table.ocr-result-table td, table.ocr-result-table th {
+                            border: 1px solid #333; /* 实线边框 */
+                            padding: 8px 12px;
+                            text-align: center;
+                            vertical-align: middle;
+                            font-size: 14px;
+                            min-width: 60px; /* 最小宽度防止太挤 */
+                        }
+
+                        /* 针对可编辑区域 (contenteditable="true") 的样式优化 */
+                        [contenteditable="true"] {
+                            background-color: #eef7ff; /*以此颜色标识可编辑区域 */
+                            color: #0056b3;
+                            cursor: text;
+                            transition: background-color 0.2s;
+                        }
+
+                        [contenteditable="true"]:focus {
+                            background-color: #fff;
+                            outline: 2px solid #2196F3; /* 聚焦时的高亮边框 */
+                            box-shadow: 0 0 5px rgba(33, 150, 243, 0.5);
+                        }
+                        
+                        /* 表头/标签列的样式 (不可编辑部分) */
+                        td:not([contenteditable="true"]) {
+                            background-color: #fafafa;
+                            font-weight: bold;
+                            color: #555;
+                        }
+                    </style>
+                </head>
+                <body>
+
+                    <div class="table-container">
+                        <h3>OCR 导出预览</h3>
+                        <style>
+			:root {
+				--bg: #f9fafb;
+				--col:   #1f2937;
+				--bg-dark: #0b0f19;
+				--col-dark: #f3f4f6;
+			}
+
+
+			body {
+				background: var(--bg);
+				color: var(--col);
+				font-family: Arial, Helvetica, sans-serif;
+			}
+
+			@media (prefers-color-scheme: dark) {
+				body {
+					background: var(--bg-dark);
+					color: var(--col-dark);
+				}
+			}
+		</style>
+<table class="ocr-result-table" style="width:370.15pt">
+<colgroup>
+<col span="5" style="width:51.00pt;" width="136">
+<col style="width:115.20pt;" width="307">
+</colgroup>
+<tbody>
+<tr height="86">
+<td>付款期限</td>
+<td contenteditable="true">壹个月</td>
+<td>出票日期</td>
+<td colspan="2" contenteditable="true">壹玖 年 月 日</td>
+<td>支票号码</td>
+<td contenteditable="true">XI 第 1 号</td>
+</tr>
+<tr height="88">
+<td class="et2">收款人</td>
+<td class="et2" colspan="2" contenteditable="true"></td>
+<td class="et2">申请人</td>
+<td class="et2" colspan="2" contenteditable="true">无</td>
+</tr>
+<tr height="92">
+<td class="et2">人民币</td>
+<td class="et2" colspan="5" contenteditable="true">凭票即付（大写）</td>
+</tr>
+</tbody>
+</table>
+                    </div>
+
+                </body>
+                </html>
+                
