@@ -37,7 +37,6 @@ class AdvancedQwen3VLApp:
     def __init__(self):
         self.model = None
         self.processor = None
-        self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
         """D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"""
         self.model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
         self.is_loaded = False
