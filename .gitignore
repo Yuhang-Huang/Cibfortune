@@ -4,3 +4,4 @@ cibfortune/testing
 cibfortune/ocr_exports
 *_real*
 cibfortune/models/*
+.DS_Store
