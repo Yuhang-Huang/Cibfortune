@@ -394,7 +394,9 @@ class CardOCRWithRAG:
         model: str = "qwen-vl-plus",
         base_url: Optional[str] = None,
         rag_image_dir: str = "rag_cards",
-        persist_directory: str = "./multimodal_chroma_card"
+        persist_directory: str = "./multimodal_chroma_card",
+        rag_feature_mode: str = "style",
+        use_api: bool = True
     ):
         """
         初始化卡证OCR识别器
@@ -405,11 +407,18 @@ class CardOCRWithRAG:
             base_url: Qwen API基础URL，如果为None则使用默认的兼容模式端点
             rag_image_dir: RAG图片库目录路径
             persist_directory: RAG向量存储持久化目录
+            rag_feature_mode: 简化版RAG使用的特征类型（"style" 使用样式特征，"clip" 使用CLIP嵌入）
+            use_api: 是否调用大模型API；True 为在线识别，False 为离线模式（仅RAG检索）
         """
         # Qwen API配置
+<<<<<<< Updated upstream
         # 优先使用传入的api_key，然后环境变量，最后使用默认key
         self.api_key = api_key or os.getenv("QWEN_API_KEY") or os.getenv("OPENAI_API_KEY") or "sk-7236eb30f8c94bfdb7113c89f907b490"
 
+=======
+        # 优先使用传入的api_key，然后环境变量
+        self.api_key = api_key or os.getenv("QWEN_API_KEY") or os.getenv("OPENAI_API_KEY")
+>>>>>>> Stashed changes
         self.model = model
         # Qwen API 默认使用兼容OpenAI格式的端点
         self.base_url = base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -421,9 +430,15 @@ class CardOCRWithRAG:
         self.persist_directory = persist_directory
         self.card_rag_store = None
         self.card_rag_ready = False
-        
+        normalized_mode = (rag_feature_mode or "style").lower()
+        self.rag_feature_mode = normalized_mode if normalized_mode in {"style", "clip"} else "style"
+        self.use_api = use_api
     def load_model(self):
         """初始化Qwen API客户端"""
+        if not self.use_api:
+            print("⚠️ 当前为离线模式（use_api=False），跳过Qwen API客户端初始化")
+            self.is_loaded = True
+            return True
         if self.is_loaded:
             print("✅ Qwen API客户端已经初始化")
             return True
@@ -495,10 +510,11 @@ class CardOCRWithRAG:
                 except Exception as e:
                     print(f"⚠️ 使用multimodal_rag加载失败，尝试使用简化版: {e}")
             
-            # 使用简化版RAG（默认使用样式特征，更适用于卡面样式匹配）
+            # 使用简化版RAG（支持样式特征或CLIP嵌入）
             try:
-                print("使用简化版RAG功能（基于卡面样式特征）...")
-                store = SimpleRAGStore(use_style_features=True)  # 使用样式特征而非CLIP
+                feature_desc = "卡面样式特征" if self.rag_feature_mode != "clip" else "CLIP图像特征"
+                print(f"使用简化版RAG功能（基于{feature_desc}）...")
+                store = SimpleRAGStore(use_style_features=self.rag_feature_mode != "clip")
                 store.load_images_from_folder(self.rag_image_dir)
                 
                 if not store.image_embeddings:
@@ -720,7 +736,7 @@ class CardOCRWithRAG:
             - success: 是否成功
             - error: 错误信息（如果有）
         """
-        if not self.is_loaded:
+        if self.use_api and not self.is_loaded:
             return {
                 "success": False,
                 "error": "模型未加载，请先调用load_model()",
@@ -781,7 +797,28 @@ class CardOCRWithRAG:
             }
         ]
         
-        # 调用Qwen API
+        # 构建RAG信息（无论是否调用API，都可以返回）
+        rag_info = None
+        if rag_results:
+            rag_info = {
+                "enabled": True,
+                "top_k": len(rag_results),
+                "results": rag_results
+            }
+        else:
+            rag_info = {"enabled": False, "reason": "RAG未启用或图片库为空"}
+        
+        # 如果不调用API，直接返回RAG结果（离线模式）
+        if not self.use_api:
+            return {
+                "success": True,
+                "result": "当前为离线模式（未调用大模型API）。已完成RAG相似检索，可根据 rag_info 查看相似图片信息。",
+                "rag_info": rag_info,
+                "generation_time": 0,
+                "error": None
+            }
+        
+        # 调用Qwen API（在线模式）
         try:
             start_time = time.time()
             
@@ -804,17 +841,6 @@ class CardOCRWithRAG:
             # 提取响应文本
             result_text = response.choices[0].message.content
             
-            # 构建RAG信息
-            rag_info = None
-            if rag_results:
-                rag_info = {
-                    "enabled": True,
-                    "top_k": len(rag_results),
-                    "results": rag_results
-                }
-            else:
-                rag_info = {"enabled": False, "reason": "RAG未启用或图片库为空"}
-            
             return {
                 "success": True,
                 "result": result_text,
@@ -828,7 +854,7 @@ class CardOCRWithRAG:
                 "success": False,
                 "error": str(e),
                 "result": None,
-                "rag_info": None,
+                "rag_info": rag_info,
                 "generation_time": 0
             }
     
@@ -955,21 +981,34 @@ def main():
     print("卡证OCR识别 - RAG增强 + Qwen3-VL API调用")
     print("=" * 60)
     
-    # 创建识别器实例（会自动使用环境变量或默认API key）
+    # 选择模式：是否调用API
+    mode_input = input("是否调用Qwen API进行识别？(y/n，默认y=调用API): ").strip().lower()
+    use_api = False if mode_input == "n" else True
+    print(f"当前模式: {'在线识别（调用API）' if use_api else '离线模式（仅RAG相似检索，不调用大模型）'}")
+    
+    # 创建识别器实例（会自动使用环境变量中的 API key）
     ocr = CardOCRWithRAG(
-        api_key=None,  # 如果为None，会使用环境变量或默认key
+        api_key=None,
         model="qwen-vl-plus",  # 或使用 "qwen-vl-max", "qwen-vl-max-longcontext"
         rag_image_dir="rag_cards",
-        persist_directory="./multimodal_chroma_card"
+        persist_directory="./multimodal_chroma_card",
+        use_api=use_api
     )
     
-    print(f"使用API密钥: {ocr.api_key[:10]}...")
+    if ocr.use_api:
+        if ocr.api_key:
+            print(f"使用API密钥: {ocr.api_key[:10]}...")
+        else:
+            print("⚠️ 未检测到 API 密钥，后续将无法调用Qwen接口")
     
-    # 初始化Qwen API客户端
+    # 初始化Qwen API客户端（仅在在线模式下）
     print("\n1. 初始化Qwen API客户端...")
-    if not ocr.load_model():
-        print("❌ Qwen API客户端初始化失败，退出")
-        return
+    if ocr.use_api:
+        if not ocr.load_model():
+            print("❌ Qwen API客户端初始化失败，退出")
+            return
+    else:
+        print("当前为离线模式（仅RAG检索），跳过API初始化")
     
     # 加载RAG图片库（可选）
     print("\n2. 加载RAG图片库...")
@@ -1010,4 +1049,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -38,6 +38,8 @@ class AdvancedQwen3VLApp:
         self.model = None
         self.processor = None
         self.model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+        """D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"""
+        self.model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
         self.is_loaded = False
         self.chat_history = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -53,8 +55,12 @@ class AdvancedQwen3VLApp:
         self.card_rag_dir = "rag_cards"
         # API 卡证OCR（RAG + Qwen API）
         self.card_api = None
+<<<<<<< Updated upstream
         # 字段模板目录
         self.field_templates_dir = "card_field_templates"
+=======
+        self.card_api_feature_mode = "clip"
+>>>>>>> Stashed changes
 
     def _ensure_card_rag_loaded(self):
         """懒加载卡证RAG图片库（若存在 rag_cards 目录），支持多种RAG实现方式。"""
@@ -108,25 +114,52 @@ class AdvancedQwen3VLApp:
             self.card_rag_ready = True
 
     def _ensure_card_api_loaded(self):
-        """懒加载卡证OCR API（RAG增强 + Qwen API 客户端）"""
+        """懒加载卡证OCR（支持 在线API模式 + 离线RAG模式）"""
         if self.card_api is not None:
             return
+
         try:
+            # 自动判断是否可用 API：环境变量中找 key
+            env_key = os.environ.get("QWEN_API_KEY") or os.environ.get("OPENAI_API_KEY")
+            has_api_key = bool(env_key)
+
+            # 判断当前是否是本地模型路径（本地路径无需调用 API）
+            is_local_model = isinstance(self.model_path, str) and os.path.isdir(self.model_path)
+
+            # 决策：只要本地模型 or 无 key → 强制离线模式
+            use_api = has_api_key and (not is_local_model)
+
             api = CardOCRWithRAG(
-                api_key=None,
-                model="qwen-vl-plus",
+                api_key=env_key if use_api else None,
+                model="qwen-vl-plus" if use_api else "local-offline",
                 rag_image_dir=self.card_rag_dir,
                 persist_directory="./multimodal_chroma_card",
+                rag_feature_mode=self.card_api_feature_mode,
+                use_api=use_api,   # ⭐ 决定是否调用 API
             )
+
+            # 加载模型（离线模式不会初始化 OpenAI client）
             api.load_model()
+
+            # 加载 RAG 图片库
             api.load_rag_library()
+
             self.card_api = api
-        except Exception:
+
+            mode_str = "在线API模式" if use_api else "离线RAG模式"
+            print(f"🟩 卡证OCR 已初始化（{mode_str}）")
+
+        except Exception as e:
+            print(f"❌ 卡证OCR初始化失败: {e}")
             self.card_api = None
-        except Exception:
-            # RAG 初始化失败时忽略，走纯模型路径
-            self.card_rag_store = None
-            self.card_rag_ready = True
+
+    def set_card_api_feature_mode(self, selection: str):
+        """更新API版卡证OCR所使用的RAG特征模式。"""
+        normalized = "clip" if selection and "clip" in selection.lower() else "style"
+        if normalized != self.card_api_feature_mode:
+            self.card_api_feature_mode = normalized
+            # 重新初始化客户端，使新设置生效
+            self.card_api = None
 
     def _rag_search_card(self, image, top_k: int = 3):
         """
@@ -266,7 +299,7 @@ class AdvancedQwen3VLApp:
                 self.model_path,
                 dtype="auto",
                 device_map="cuda",
-                load_in_4bit=True,
+                load_in_4bit=False,
             )
 
             progress(0.7, desc="加载处理器...")
@@ -1138,6 +1171,7 @@ def _toggle_mode(mode, current_task, current_code_format):
     task_value = current_task if is_pro else "任务问答"
     code_visible = is_pro and task_value == "视觉编程"
     text_value = _get_default_prompt(task_value, current_code_format) if is_pro else ""
+    rag_visible = is_pro and task_value == "卡证OCR识别（API）"
     return (
         gr.update(visible=is_pro),                       # adv_params_box
         gr.update(visible=is_pro),                       # stats_output
@@ -1145,6 +1179,7 @@ def _toggle_mode(mode, current_task, current_code_format):
         gr.update(visible=is_pro),                       # tab_compare
         gr.update(visible=is_pro, value=task_value),     # pro_task dropdown
         gr.update(visible=code_visible),                 # code_format dropdown
+        gr.update(visible=rag_visible),                  # rag_feature_selector
         gr.update(value=text_value),                     # text_input prompt
     )
 
@@ -1156,7 +1191,8 @@ def _toggle_task(task, code_format):
     code_kwargs = {"visible": is_visual}
     if is_visual and not code_format:
         code_kwargs["value"] = "HTML"
-    return gr.update(**code_kwargs), gr.update(value=prompt)
+    rag_visible = (task == "卡证OCR识别（API）")
+    return gr.update(**code_kwargs), gr.update(value=prompt), gr.update(visible=rag_visible)
 
 
 def _update_code_prompt(task, code_format):
@@ -1174,6 +1210,7 @@ def handle_unified_chat(image,
                         top_k,
                         mode,
                         pro_task,
+                        rag_feature_mode,
                         code_format,
                         repetition_penalty,
                         presence_penalty):
@@ -1280,6 +1317,7 @@ def handle_unified_chat(image,
                 return
 
             if task == "卡证OCR识别（API）":
+                app.set_card_api_feature_mode(rag_feature_mode)
                 if image is None:
                     stats_update = gr.update(value=_plain_text_to_html("❌ 请上传图像！"), visible=True)
                     yield history, text, stats_update, gr.update(interactive=False), "❌ 请上传图像！"
@@ -1718,6 +1756,12 @@ def create_unified_interface():
                     label="专业任务",
                     visible=False,
                 )
+                rag_feature_selector = gr.Radio(
+                    choices=["样式特征RAG", "CLIP图像特征"],
+                    value="样式特征RAG",
+                    label="卡证RAG特征模式",
+                    visible=False,
+                )
             with gr.Column(scale=1, min_width=240):
                 load_btn = gr.Button("🔄 加载模型", variant="primary")
                 status_text = gr.Textbox(
@@ -1809,12 +1853,12 @@ def create_unified_interface():
             # 通用/专业两种调用路径（利用同一高级应用，专业多两个参数与统计输出）
             send_btn.click(
                 handle_unified_chat,
-                inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k, mode, pro_task, code_format, repetition_penalty, presence_penalty],
+                inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k, mode, pro_task, rag_feature_selector, code_format, repetition_penalty, presence_penalty],
                 outputs=[chatbot, text_input, stats_output, ocr_export_btn, ocr_export_status],
             )
             text_input.submit(
                 handle_unified_chat,
-                inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k, mode, pro_task, code_format, repetition_penalty, presence_penalty],
+                inputs=[image_input, text_input, chatbot, max_tokens, temperature, top_p, top_k, mode, pro_task, rag_feature_selector, code_format, repetition_penalty, presence_penalty],
                 outputs=[chatbot, text_input, stats_output, ocr_export_btn, ocr_export_status],
             )
             def _clear_session():
@@ -1879,13 +1923,13 @@ def create_unified_interface():
         mode.change(
             _toggle_mode,
             inputs=[mode, pro_task, code_format],
-            outputs=[adv_params_box, stats_output, tab_batch, tab_compare, pro_task, code_format, text_input],
+            outputs=[adv_params_box, stats_output, tab_batch, tab_compare, pro_task, code_format, rag_feature_selector, text_input],
         )
 
         pro_task.change(
             _toggle_task,
             inputs=[pro_task, code_format],
-            outputs=[code_format, text_input],
+            outputs=[code_format, text_input, rag_feature_selector],
         )
 
         code_format.change(
