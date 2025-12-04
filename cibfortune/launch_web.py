@@ -74,8 +74,8 @@ def install_missing_deps():
 
 def check_model():
     """检查模型"""
-    model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
-    
+    # model_path = "D:\cibfortune\Cibfortune\cibfortune\models\qwen3-vl-2b-instruct"
+    model_path = "/data/storage1/wulin/models/qwen3-vl-8b-instruct"
     
     print(f"🔍 检查模型路径: {model_path}")
     
@@ -172,7 +172,7 @@ def main():
         elif choice == "1":
             if check_dependencies() and check_model():
                 try:
-                    from gradio_unified1 import main as unified_main
+                    from gradio_unified import main as unified_main
                     unified_main()
                 except Exception as e:
                     print(f"❌ 启动失败: {e}")

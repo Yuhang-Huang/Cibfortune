@@ -411,14 +411,8 @@ class CardOCRWithRAG:
             use_api: 是否调用大模型API；True 为在线识别，False 为离线模式（仅RAG检索）
         """
         # Qwen API配置
-<<<<<<< Updated upstream
-        # 优先使用传入的api_key，然后环境变量，最后使用默认key
-        self.api_key = api_key or os.getenv("QWEN_API_KEY") or os.getenv("OPENAI_API_KEY") or "sk-7236eb30f8c94bfdb7113c89f907b490"
-
-=======
         # 优先使用传入的api_key，然后环境变量
         self.api_key = api_key or os.getenv("QWEN_API_KEY") or os.getenv("OPENAI_API_KEY")
->>>>>>> Stashed changes
         self.model = model
         # Qwen API 默认使用兼容OpenAI格式的端点
         self.base_url = base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
