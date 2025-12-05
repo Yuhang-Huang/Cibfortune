@@ -412,7 +412,7 @@ class CardOCRWithRAG:
         """
         # Qwen API配置
         # 优先使用传入的api_key，然后环境变量
-        self.api_key = api_key or os.getenv("QWEN_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or os.getenv("QWEN_API_KEY") or os.getenv("OPENAI_API_KEY") or "sk-7236eb30f8c94bfdb7113c89f907b490"
         self.model = model
         # Qwen API 默认使用兼容OpenAI格式的端点
         self.base_url = base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
