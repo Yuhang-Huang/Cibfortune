@@ -5,3 +5,5 @@ cibfortune/ocr_exports
 *_real*
 cibfortune/models/*
 .DS_Store
+cibfortune/chat_history
+
