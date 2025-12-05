@@ -32,6 +32,7 @@ from image import paddleocr_super_resolution
 from bs4 import BeautifulSoup
 import styles
 import ast
+from seal_removal import SealRemover
 
 # 尝试导入PDF处理库
 PDF_AVAILABLE = False
@@ -114,12 +115,21 @@ class AdvancedQwen3VLApp:
         self.current_field_template_html = None  # 存储HTML表格结构
         self.current_final_fields_html = None  # 存储最终字段列表的HTML（包含自定义字段）
         self.current_parsed_dict = None
+        # 印章淡化器
+        self.seal_remover = SealRemover()
 
-    def _super_resolve_image_for_ocr(self, image):
+    def _super_resolve_image_for_ocr(self, image, enable_seal_removal=False):
         """
         使用 image.py 中的双三次插值函数对图像进行超分辨率处理，
         在提供给大模型前尽可能提升清晰度。
         兼容 PIL.Image 和 numpy.ndarray 输入，失败时回退为原图。
+        
+        Args:
+            image: 输入图像（PIL.Image 或 numpy.ndarray）
+            enable_seal_removal: 是否在超分辨率处理后进行印章淡化
+        
+        Returns:
+            处理后的图像（PIL.Image）
         """
         if image is None:
             return None
@@ -135,48 +145,89 @@ class AdvancedQwen3VLApp:
                     # 无法转换时直接返回原始输入
                     return image
 
-            # 将图像暂存为临时文件，复用 image.py 中的 paddleocr_super_resolution 逻辑
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                tmp_in = f.name
-                pil_img.save(tmp_in, format="PNG")
+            # 检查图像尺寸，如果大于1200x1200，跳过超分辨率处理
+            width, height = pil_img.size
+            skip_super_resolution = width > 1200 or height > 1200
+            
+            if skip_super_resolution:
+                print(f"ℹ️ 图像尺寸 {width}x{height} 大于 1200x1200，跳过超分辨率处理")
+                result_img = pil_img
+            else:
+                # 将图像暂存为临时文件，复用 image.py 中的 paddleocr_super_resolution 逻辑
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    tmp_in = f.name
+                    pil_img.save(tmp_in, format="PNG")
 
-            tmp_out = tmp_in.replace(".png", "_sr.png")
+                tmp_out = tmp_in.replace(".png", "_sr.png")
 
-            try:
-                upscaled = paddleocr_super_resolution(
-                    tmp_in,
-                    output_path=tmp_out,
-                )
-            except Exception as e:
-                print(f"⚠️ 超分辨率处理失败，使用原图: {e}")
-                return pil_img
-            finally:
-                # 清理输入临时文件（输出文件可能供排查使用，先不强制删除）
                 try:
-                    if os.path.exists(tmp_in):
-                        os.remove(tmp_in)
-                except Exception:
-                    pass
-
-            if upscaled is None:
-                # 处理失败时直接返回原图
-                return pil_img
-
-            # image.py 返回的是 OpenCV BGR 格式的 ndarray
-            if isinstance(upscaled, np.ndarray):
-                try:
-                    upscaled_rgb = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
-                    return Image.fromarray(upscaled_rgb)
+                    upscaled = paddleocr_super_resolution(
+                        tmp_in,
+                        output_path=tmp_out,
+                    )
                 except Exception as e:
-                    print(f"⚠️ 转换超分图像为PIL失败，使用原图: {e}")
-                    return pil_img
+                    print(f"⚠️ 超分辨率处理失败，使用原图: {e}")
+                    result_img = pil_img
+                finally:
+                    # 清理输入临时文件（输出文件可能供排查使用，先不强制删除）
+                    try:
+                        if os.path.exists(tmp_in):
+                            os.remove(tmp_in)
+                    except Exception:
+                        pass
 
-            # 如果未来 paddleocr_super_resolution 直接返回 PIL.Image，也能兼容
-            if isinstance(upscaled, Image.Image):
-                return upscaled
+                if upscaled is None:
+                    # 处理失败时直接返回原图
+                    result_img = pil_img
+                else:
+                    # image.py 返回的是 OpenCV BGR 格式的 ndarray
+                    if isinstance(upscaled, np.ndarray):
+                        try:
+                            upscaled_rgb = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
+                            result_img = Image.fromarray(upscaled_rgb)
+                        except Exception as e:
+                            print(f"⚠️ 转换超分图像为PIL失败，使用原图: {e}")
+                            result_img = pil_img
+                    elif isinstance(upscaled, Image.Image):
+                        result_img = upscaled
+                    else:
+                        # 其他未知类型，回退为原图
+                        result_img = pil_img
 
-            # 其他未知类型，回退为原图
-            return pil_img
+            # 如果启用了印章淡化，在超分辨率处理后（或原图）进行印章淡化
+            if enable_seal_removal:
+                try:
+                    # 将处理后的图像保存为临时文件
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                        seal_tmp_in = f.name
+                        result_img.save(seal_tmp_in, format="PNG")
+                    
+                    seal_tmp_out = seal_tmp_in.replace(".png", "_seal_removed.png")
+                    
+                    # 使用HSV方法进行印章淡化
+                    seal_removed = self.seal_remover._remove_seal_hsv(seal_tmp_in, seal_tmp_out)
+                    
+                    # 读取处理后的图像
+                    if seal_removed is not None and os.path.exists(seal_tmp_out):
+                        # 将BGR格式转换为RGB格式
+                        seal_removed_rgb = cv2.cvtColor(seal_removed, cv2.COLOR_BGR2RGB)
+                        result_img = Image.fromarray(seal_removed_rgb)
+                        print("✅ 印章淡化处理完成")
+                    
+                    # 清理临时文件
+                    try:
+                        if os.path.exists(seal_tmp_in):
+                            os.remove(seal_tmp_in)
+                        if os.path.exists(seal_tmp_out):
+                            os.remove(seal_tmp_out)
+                    except Exception:
+                        pass
+                        
+                except Exception as e:
+                    print(f"⚠️ 印章淡化处理失败，使用超分辨率结果: {e}")
+                    # 印章淡化失败时，返回超分辨率处理后的图像
+
+            return result_img
 
         except Exception as e:
             print(f"⚠️ 超分辨率预处理异常，使用原图: {e}")
@@ -693,14 +744,14 @@ class AdvancedQwen3VLApp:
         self.field_template_htmls = html_templates
         return templates
 
-    def detect_card_type(self, image):
+    def detect_card_type(self, image, enable_seal_removal=False):
         """第一步：识别卡证类型并加载默认字段模板"""
         if image is None:
             return None, [], "❌ 请先上传图片"
         
         try:
             # 在提供给大模型前先做一次超分辨率预处理
-            image_sr = self._super_resolve_image_for_ocr(image)
+            image_sr = self._super_resolve_image_for_ocr(image, enable_seal_removal=enable_seal_removal)
 
             self._ensure_card_api_loaded()
             if self.card_api is None:
@@ -781,7 +832,7 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             return None, [], None, f"❌ 识别失败: {str(e)}"
 
-    def detect_bill_type(self, image):
+    def detect_bill_type(self, image, enable_seal_removal=False):
         """票据识别第一步：识别票据类型并加载默认字段模板（使用HTML模板）"""
         fixed_bill_type = ["银行承兑汇票", "商业承兑汇票", "转账支票", "现金支票", "普通支票", "本票", "付款回单", "收款回单", "代发业务回单", "电子发票（铁路电子客票）",]
         extendable_bill_type = ["代发业务清单", "单位活期明细对账单", "电子发票（增值税专用发票）", "电子发票（普通发票）", "中央非税收入统一票据" ]
@@ -793,7 +844,7 @@ class AdvancedQwen3VLApp:
         
         try:
             # 在提供给大模型前先做一次超分辨率预处理
-            image_sr = self._super_resolve_image_for_ocr(image)
+            image_sr = self._super_resolve_image_for_ocr(image, enable_seal_removal=enable_seal_removal)
 
             self._ensure_bill_api_loaded()
             if self.bill_api is None:
@@ -900,7 +951,7 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             return [], f"❌ 更新字段失败: {str(e)}"
 
-    def ocr_card_with_fields(self, image, fields_to_extract):
+    def ocr_card_with_fields(self, image, fields_to_extract, enable_seal_removal=False):
         """第三步：使用指定字段进行OCR识别"""
         if image is None:
             return "❌ 请先上传图片"
@@ -910,7 +961,7 @@ class AdvancedQwen3VLApp:
         
         try:
             # 在提供给大模型前先做一次超分辨率预处理
-            image_sr = self._super_resolve_image_for_ocr(image)
+            image_sr = self._super_resolve_image_for_ocr(image, enable_seal_removal=enable_seal_removal)
 
             self._ensure_card_api_loaded()
             if self.card_api is None:
@@ -1073,7 +1124,7 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             return f"❌ OCR识别失败: {str(e)}"
 
-    def ocr_bill_with_fields(self, image, fields_to_extract):
+    def ocr_bill_with_fields(self, image, fields_to_extract, enable_seal_removal=False):
         """票据OCR第三步：使用指定字段进行OCR识别（使用HTML模板）"""
         if image is None:
             return "❌ 请先上传图片"
@@ -1083,7 +1134,7 @@ class AdvancedQwen3VLApp:
         
         try:
             # 在提供给大模型前先做一次超分辨率预处理
-            image_sr = self._super_resolve_image_for_ocr(image)
+            image_sr = self._super_resolve_image_for_ocr(image, enable_seal_removal=enable_seal_removal)
 
             self._ensure_bill_api_loaded()
             if self.bill_api is None:
@@ -1593,437 +1644,16 @@ class AdvancedQwen3VLApp:
         except Exception as e:
             return f"❌ OCR识别失败: {str(e)}"
 
-    def ocr_card(self, image, prompt: str = None):
-        """卡证OCR识别：身份证/银行卡/驾驶证等结构化提取（使用本地模型）"""
-        if not self.is_loaded:
-            return "❌ 请先加载模型！"
-        
-        # 使用与ocr_card_api相同的默认提示词
-        default_prompt = (
-                "你是专业的卡证OCR引擎，请对输入图片进行结构化识别，并仅输出Markdown表格。\n"
-                "\n"
-                "任务要求如下：\n"
-                "\n"
-            "1. 识别卡证类型：只允许从以下类别中选择一种：\n"
-            "   - 身份证 / 银行卡 / 驾驶证 / 护照 / 工牌 / 其他。\n"
-            "   Markdown表格中添加“卡证类型”字段，并用类别选择赋值。\n"
-            "   **重要**：如果识别为银行卡，必须严格遵守第3条银行卡特殊要求！\n"
-            "\n"
-            "2. 输出格式：\n"
-            "   - 以Markdown表格形式输出所有识别出的关键字段及其对应的值。\n"
-            "   - 若字段中包含“卡号”，请确保该字段的值仅包含数字。\n"
-            "   - 不要使用代码块标记符号（例如 ``` ）。\n"
-            "\n"
-            "3. 银行卡特殊要求（必须严格遵守）：\n"
-            "   如果识别的卡证类型是银行卡，必须在Markdown表格的最后额外添加一个字段：\n"
-            "   - 字段名：卡面类型（必须添加，不可省略）。\n"
-            "   - 基于图片库检索到的相似卡证结果，填充“卡面类型”字段。字段值规则如下：\n"
-            "       ① 当出现任何不确定、模糊或不匹配情况时，“卡面类型”字段的值**必须且只能为“其他”**，不得填写相似图片名或其他文本。\n"
-            "       ② 若识别出的“发卡行”字段的值与这些相似卡证文件名中`_`前面的银行名称相同，"
-            "则“卡面类型”字段的值只能从相似卡证文件名中**严格选择一个**，格式为`银行名称_卡面类型`，去掉文件后缀名，如`中国银行_visa卡`。\n"
-            "       ③ 禁止自定义、生成、猜测或编造新的卡面类型值。任何不存在基于图片库检索到的相似卡证文件名的值都视为错误。\n"
-            "   **重要提醒**：银行卡的Markdown表格必须包含“卡面类型”字段，这是强制要求，不能省略！\n"
-            "   - 如果不是银行卡，则不添加“卡面类型”字段。\n"
-            "\n"
-            "4. 输出限制：\n"
-            "   - 最终输出只包含Markdown表格。\n"
-            "   - 禁止输出任何其他文字或解释性内容。\n"
-            "   - 如果是银行卡，表格中必须包含“卡面类型”字段，否则输出不完整。\n"
-        )
 
-        effective_prompt = (prompt or "").strip() or default_prompt
 
-        # RAG检索（使用与API版本相同的逻辑）
-        rag_results = []
-        try:
-            self._ensure_card_rag_loaded()
-            if self.card_rag_store and getattr(self.card_rag_store, "image_embeddings", None):
-                rag_results = self._rag_search_card(image, top_k=3)
-        except Exception as e:
-            print(f"⚠️ RAG检索失败: {str(e)}")
-            rag_results = []
+   
 
-        # 在终端输出RAG相似度匹配结果（与API版本一致）
-        if rag_results:
-            print("\n" + "=" * 60)
-            print("📊 RAG相似度匹配结果")
-            print("=" * 60)
-            print(f"找到 {len(rag_results)} 张相似图片：\n")
-            for i, r in enumerate(rag_results, 1):
-                filename = r.get("filename", "未知")
-                similarity = r.get("similarity", 0.0)
-                print(f"  {i}. {filename}")
-                print(f"     相似度: {similarity:.4f} ({similarity*100:.2f}%)")
-            print("=" * 60 + "\n")
-        else:
-            print("\n⚠️ 未找到相似图片\n")
-
-        # 构建增强提示词（使用与API版本相同的逻辑）
-        enhanced_prompt = self._build_enhanced_prompt_card(
-            base_prompt=default_prompt,
-            rag_results=rag_results,
-            custom_prompt=effective_prompt if (prompt or "").strip() else None
-        )
-
-        # 在终端输出发送给模型的完整prompt（与API版本一致）
-        print("\n" + "=" * 80)
-        print("📝 发送给模型的完整Prompt")
-        print("=" * 80)
-        print(enhanced_prompt)
-        print("=" * 80 + "\n")
-
-        try:
-            # 使用本地模型进行推理
-            prompt_clean, response, _ = self._run_inference(
-                image,
-                enhanced_prompt,
-                max_tokens=1024,
-                temperature=0.3,
-                top_p=0.8,
-                top_k=40,
-                repetition_penalty=1.05
-            )
-            cleaned = self._sanitize_markdown(response)
-            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
-            self.last_ocr_markdown = f"## 卡证OCR识别结果\n\n{cleaned}"
-            self.last_ocr_html = "<h2>卡证OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
-            return f"🪪 卡证OCR识别结果:\n\n{cleaned}"
-        except ValueError as exc:
-            return str(exc)
-        except Exception as e:
-            return f"❌ 卡证OCR识别失败: {str(e)}"
-
-    def ocr_card_api(self, image, prompt: str = None):
-        """卡证OCR识别（API调用 + RAG增强）"""
-        # 注：如无需强制本地模型加载，可移除此判断
-        try:
-            self._ensure_card_api_loaded()
-            if self.card_api is None:
-                return "�?卡证OCR 初始化失败"
-            default_prompt = (
-                "你是专业的卡证OCR引擎，请对输入图片进行结构化识别，并仅输出Markdown表格。\n"
-                "\n"
-                "任务要求如下：\n"
-                "\n"
-            "1. 识别卡证类型：只允许从以下类别中选择一种：\n"
-            "   - 身份证 / 银行卡 / 驾驶证 / 护照 / 工牌 / 其他。\n"
-            "   Markdown表格中添加“卡证类型”字段，并用类别选择赋值。\n"
-            "   **重要**：如果识别为银行卡，必须严格遵守第3条银行卡特殊要求！\n"
-            "\n"
-            "2. 输出格式：\n"
-            "   - 以Markdown表格形式输出所有识别出的关键字段及其对应的值。\n"
-            "   - 若字段中包含“卡号”，请确保该字段的值仅包含数字。\n"
-            "   - 不要使用代码块标记符号（例如 ``` ）。\n"
-            "\n"
-            "3. 银行卡特殊要求（必须严格遵守）：\n"
-            "   如果识别的卡证类型是银行卡，必须在Markdown表格的最后额外添加一个字段：\n"
-            "   - 字段名：卡面类型（必须添加，不可省略）。\n"
-            "   - 基于图片库检索到的相似卡证结果，填充“卡面类型”字段。字段值规则如下：\n"
-            "       ① 当出现任何不确定、模糊或不匹配情况时，“卡面类型”字段的值**必须且只能为“其他”**，不得填写相似图片名或其他文本。\n"
-            "       ② 若识别出的“发卡行”字段的值与这些相似卡证文件名中`_`前面的银行名称相同，"
-            "则“卡面类型”字段的值只能从相似卡证文件名中**严格选择一个**，格式为`银行名称_卡面类型`，去掉文件后缀名，如`中国银行_visa卡`。\n"
-            "       ③ 禁止自定义、生成、猜测或编造新的卡面类型值。任何不存在基于图片库检索到的相似卡证文件名的值都视为错误。\n"
-            "   **重要提醒**：银行卡的Markdown表格必须包含“卡面类型”字段，这是强制要求，不能省略！\n"
-            "   - 如果不是银行卡，则不添加“卡面类型”字段。\n"
-            "\n"
-            "4. 输出限制：\n"
-            "   - 最终输出只包含Markdown表格。\n"
-            "   - 禁止输出任何其他文字或解释性内容。\n"
-            "   - 如果是银行卡，表格中必须包含“卡面类型”字段，否则输出不完整。\n"
-            )
-
-            effective_prompt = (prompt or "").strip() or default_prompt
-            result = self.card_api.recognize_card(
-                image,
-                custom_prompt=effective_prompt,
-                use_rag=True,
-            )
-            if not result.get("success"):
-                return f"�?卡证OCR 调用失败: {result.get('error') or '未知错误'}"
-
-            # 在终端输出RAG相似度匹配结果
-            rag_info = result.get("rag_info")
-            if rag_info and rag_info.get("enabled") and rag_info.get("results"):
-                print("\n" + "=" * 60)
-                print("📊 RAG相似度匹配结果")
-                print("=" * 60)
-                print(f"找到 {len(rag_info['results'])} 张相似图片：\n")
-                for i, r in enumerate(rag_info["results"], 1):
-                    filename = r.get("filename", "未知")
-                    similarity = r.get("similarity", 0.0)
-                    print(f"  {i}. {filename}")
-                    print(f"     相似度: {similarity:.4f} ({similarity*100:.2f}%)")
-                print("=" * 60 + "\n")
-            elif rag_info and not rag_info.get("enabled"):
-                print(f"\n⚠️ RAG未启用: {rag_info.get('reason', '未知原因')}\n")
-            else:
-                print("\n⚠️ 未找到相似图片\n")
-
-            cleaned = self._sanitize_markdown(result.get("result") or "")
-            self.last_ocr_markdown = f"## 卡证OCR识别结果\n\n{cleaned}"
-            self.last_ocr_html = "<h2>卡证OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
-            return f"🪪 卡证OCR识别结果:\n\n{cleaned}"
-        except Exception as e:
-            return f"�?卡证OCR识别失败: {str(e)}"
-
-    def ocr_receipt(self, image, prompt: str = None):
-        """票据OCR识别：发票/小票等表格与关键项解析"""
-        if not self.is_loaded:
-            return "❌ 请先加载模型！"
-        default_prompt = (
-            "你是发票/小票OCR专家。请解析图片中的票据并输出：\n"
-            "- 以Markdown表格给出关键信息：票据类型、开票日期、发票代码、发票号码、校验码、购买方、销售方、税号、项目、数量、单价、金额、税率、税额、合计金额(含税/不含税)；\n"
-            "- 若检测到多行项目，请以表格形式逐行列出；\n"
-            "- 表格下方给出识别置信度与可疑项提示；\n"
-            "- 不要使用围栏代码块，保持Markdown可渲染。"
-        )
-        effective_prompt = (prompt or "").strip() or default_prompt
-        try:
-            prompt_clean, response, _ = self._run_inference(
-                image,
-                effective_prompt,
-                max_tokens=1536,
-                temperature=0.2,
-                top_p=0.8,
-                top_k=40,
-                repetition_penalty=1.05
-            )
-            cleaned = self._sanitize_markdown(response)
-            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
-            self.last_ocr_markdown = f"## 票据OCR识别结果\n\n{cleaned}"
-            self.last_ocr_html = "<h2>票据OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
-            return f"🧾 票据OCR识别结果:\n\n{cleaned}"
-        except ValueError as exc:
-            return str(exc)
-        except Exception as e:
-            return f"❌ 票据OCR识别失败: {str(e)}"
-
-    def ocr_agreement(self, image, prompt: str = None):
-        """协议OCR识别：合同/协议段落与条款解析"""
-        if not self.is_loaded:
-            return "❌ 请先加载模型！"
-        default_prompt = (
-            "你是合同/协议OCR与条款解析助手。请完成：\n"
-            "1) 识别全文，保持段落结构；\n"
-            "2) 以Markdown表格提炼关键信息：合同名称、甲方、乙方、签署日期、生效日期、终止日期、金额/币种、违约条款、争议解决、签章情况；\n"
-            "3) 如有编号的条款，保留编号并逐条列出；\n"
-            "4) 在末尾给出“风险提示”列表（如空白处、涂改处、关键要素缺失等）；\n"
-            "5) 不要输出围栏代码块。"
-        )
-        effective_prompt = (prompt or "").strip() or default_prompt
-        try:
-            prompt_clean, response, _ = self._run_inference(
-                image,
-                effective_prompt,
-                max_tokens=2048,
-                temperature=0.3,
-                top_p=0.8,
-                top_k=40,
-                repetition_penalty=1.05
-            )
-            cleaned = self._sanitize_markdown(response)
-            self.chat_history.append([f"👤 {prompt_clean}", f"🤖 {cleaned}"])
-            self.last_ocr_markdown = f"## 协议OCR识别结果\n\n{cleaned}"
-            self.last_ocr_html = "<h2>协议OCR识别结果</h2>" + self._render_sections_as_html(cleaned)
-            return f"📄 协议OCR识别结果:\n\n{cleaned}"
-        except ValueError as exc:
-            return str(exc)
-        except Exception as e:
-            return f"❌ 协议OCR识别失败: {str(e)}"
-
-    def _format_ocr_result(self, result):
-        """
-        格式化 OCR 结果为纯文本字符串（只提取 rec_texts 内容，不包含坐标等信息）
-        
-        Args:
-            result: OCR 结果，可能是字符串、字典或其他类型
-            
-        Returns:
-            格式化后的纯文本字符串（只包含识别到的文本内容）
-        """
-        import json
-        if result is None:
-            return ""
-        
-        if isinstance(result, str):
-            # 如果是字符串，直接返回
-            return result
-        elif isinstance(result, dict):
-            # 如果是字典，优先提取 rec_texts（PaddleOCR API 返回的文本字段）
-            if "rec_texts" in result:
-                rec_texts = result["rec_texts"]
-                if isinstance(rec_texts, list):
-                    # 如果是列表，合并所有文本行
-                    return "\n".join(str(text) for text in rec_texts if text)
-                else:
-                    return str(rec_texts)
-            # 其次查找其他常见的文本字段
-            elif "text" in result:
-                text = result["text"]
-                if isinstance(text, list):
-                    return "\n".join(str(t) for t in text if t)
-                return str(text)
-            elif "content" in result:
-                content = result["content"]
-                if isinstance(content, list):
-                    return "\n".join(str(c) for c in content if c)
-                return str(content)
-            elif "prunedResult" in result:
-                # 递归处理 prunedResult，提取其中的 rec_texts
-                return self._format_ocr_result(result["prunedResult"])
-            elif "result" in result:
-                return self._format_ocr_result(result["result"])
-            else:
-                # 如果字典中没有明确的文本字段，返回空字符串（不返回坐标等元数据）
-                return ""
-        elif isinstance(result, list):
-            # 如果是列表，提取每个元素的文本内容
-            text_parts = []
-            for item in result:
-                text = self._format_ocr_result(item)
-                if text:  # 只添加非空文本
-                    text_parts.append(text)
-            return "\n".join(text_parts)
-        else:
-            # 其他类型直接转换为字符串
-            return str(result)
-
-    def _chunk_text_for_rag(self, text, chunk_size=500, overlap=50, max_chunks=1000):
-        """
-        对文本进行切片，用于RAG相似度计算
-        
-        Args:
-            text: 要切片的文本
-            chunk_size: 每个切片的最大字符数
-            overlap: 切片之间的重叠字符数
-            max_chunks: 最大切片数量（防止内存溢出）
-            
-        Returns:
-            文本切片列表
-        """
-        if not text:
-            return []
-        
-        # 安全检查：确保 overlap < chunk_size，防止无限循环
-        if overlap >= chunk_size:
-            overlap = max(1, chunk_size // 10)  # 默认使用10%的重叠
-        
-        chunks = []
-        start = 0
-        text_length = len(text)
-        prev_start = -1  # 用于检测是否卡住
-        
-        # 如果文本太大，先限制处理范围
-        if text_length > 1000000:  # 如果超过1MB，只处理前1MB
-            print(f"⚠️ 文本过大（{text_length}字符），仅处理前1MB用于切片")
-            text = text[:1000000]
-            text_length = len(text)
-        
-        while start < text_length and len(chunks) < max_chunks:
-            end = min(start + chunk_size, text_length)
-            chunk = text[start:end].strip()
-            
-            if chunk:
-                chunks.append(chunk)
-            
-            # 计算下一个起始位置
-            next_start = end - overlap
-            # 安全检查：确保向前移动
-            if next_start <= start:
-                next_start = start + 1  # 至少移动1个字符
-            
-            # 防止卡在同一个位置
-            if next_start == prev_start:
-                next_start = start + chunk_size  # 强制移动
-            
-            prev_start = start
-            start = next_start
-        
-        if len(chunks) >= max_chunks:
-            print(f"⚠️ 切片数量达到上限（{max_chunks}），已停止切片")
-        
-        return chunks
     
-    def _calculate_text_similarity(self, query, text):
-        """
-        计算查询文本与目标文本的相似度（使用简单的词重叠度）
-        
-        Args:
-            query: 查询文本（关键字段）
-            text: 目标文本（切片内容）
-            
-        Returns:
-            相似度分数（0-1之间）
-        """
-        if not query or not text:
-            return 0.0
-        
-        # 转换为小写并分词
-        query_words = set(query.lower().split())
-        text_words = set(text.lower().split())
-        
-        if not query_words:
-            return 0.0
-        
-        # 计算交集和并集
-        intersection = query_words & text_words
-        union = query_words | text_words
-        
-        # Jaccard相似度
-        if not union:
-            return 0.0
-        
-        jaccard = len(intersection) / len(union)
-        
-        # 同时考虑查询词在文本中的出现频率
-        text_lower = text.lower()
-        query_lower = query.lower()
-        if query_lower in text_lower:
-            # 如果查询文本完全包含在目标文本中，增加相似度
-            jaccard = max(jaccard, 0.5)
-        
-        return jaccard
+
+  
+
+   
     
-    def _rag_search_text_chunks(self, key_fields, text_chunks, top_k=3):
-        """
-        根据关键字段对文本切片进行RAG相似度映射，返回相似度最高的top_k个切片
-        
-        Args:
-            key_fields: 关键字段列表（用户自定义）
-            text_chunks: 文本切片列表
-            top_k: 返回最相似的切片数量
-            
-        Returns:
-            每个关键字段对应的最相似切片列表
-        """
-        if not key_fields or not text_chunks:
-            return {}
-        
-        field_chunks = {}
-        
-        for field in key_fields:
-            if not field or not field.strip():
-                continue
-            
-            field = field.strip()
-            similarities = []
-            
-            # 计算每个切片与关键字段的相似度
-            for idx, chunk in enumerate(text_chunks):
-                similarity = self._calculate_text_similarity(field, chunk)
-                similarities.append({
-                    'chunk_index': idx,
-                    'chunk_text': chunk,
-                    'similarity': similarity
-                })
-            
-            # 按相似度排序，取top_k
-            similarities.sort(key=lambda x: x['similarity'], reverse=True)
-            top_chunks = similarities[:top_k]
-            
-            field_chunks[field] = top_chunks
-        
-        return field_chunks
 
     def _pdf_to_images(self, pdf_path_or_bytes):
         """
@@ -2080,706 +1710,10 @@ class AdvancedQwen3VLApp:
         return None
     
 
-    PADDLEOCR_API_URL = "https://wdc9jbw9l1f8996b.aistudio-app.com/ocr"
-    PADDLEOCR_TOKEN = "61236296494fb5e32ee89aef50d4d6aa99fa2ba7"
-
-    def _parse_pdf_page_spec(self, pages_spec: str, total_pages: int):
-        """
-        解析用户输入的页码字符串，支持格式：
-        - 逗号分隔页码：1,3,5
-        - 区间：2-4
-        - 混合输入与空格
-        返回去重且排序后的页码列表（1-based）
-        """
-        if not pages_spec or not pages_spec.strip():
-            return []
-
-        normalized = (
-            pages_spec.replace("，", ",")
-            .replace("、", ",")
-            .replace(";", ",")
-            .strip()
-        )
-        if not normalized:
-            return []
-
-        tokens = re.split(r"[,\s]+", normalized)
-        selected_pages = set()
-
-        for token in tokens:
-            if not token:
-                continue
-            token = token.strip()
-            if not token:
-                continue
-            if "-" in token:
-                parts = token.split("-", 1)
-                if len(parts) != 2:
-                    continue
-                try:
-                    start = int(parts[0])
-                    end = int(parts[1])
-                except ValueError:
-                    continue
-                if start > end:
-                    start, end = end, start
-                for page in range(start, end + 1):
-                    if 1 <= page <= total_pages:
-                        selected_pages.add(page)
-            else:
-                try:
-                    page = int(token)
-                except ValueError:
-                    continue
-                if 1 <= page <= total_pages:
-                    selected_pages.add(page)
-
-        return sorted(selected_pages)
-
-    def _filter_pdf_pages(self, pdf_path: str, pages_spec: str):
-        """
-        根据页码过滤PDF页面，只返回包含指定页的新PDF路径。
-        如果解析失败或依赖缺失则返回None。
-        """
-        if not os.path.exists(pdf_path):
-            return None
-
-        pages_spec = pages_spec or ""
-        if pages_spec.strip().lower() == "all":
-            return None
-
-        # 优先使用 PyMuPDF，失败后再尝试 PyPDF2
-        if PYMUPDF_AVAILABLE:
-            try:
-                import fitz
-
-                src_doc = fitz.open(pdf_path)
-                total_pages = src_doc.page_count
-                selected_pages = self._parse_pdf_page_spec(pages_spec, total_pages)
-
-                if not selected_pages:
-                    print("⚠️ PDF页码解析为空，继续识别全部页面")
-                    return None
-
-                filtered_doc = fitz.open()
-                for page_num in selected_pages:
-                    filtered_doc.insert_pdf(
-                        src_doc, from_page=page_num - 1, to_page=page_num - 1
-                    )
-
-                temp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-                temp_pdf_path = temp_pdf.name
-                temp_pdf.close()
-                filtered_doc.save(temp_pdf_path)
-                filtered_doc.close()
-                src_doc.close()
-                print(f"✅ 使用PyMuPDF 过滤PDF页面: {selected_pages}")
-                return temp_pdf_path
-            except Exception as e:
-                print(f"⚠️ 使用PyMuPDF过滤PDF失败: {e}")
-
-        try:
-            from PyPDF2 import PdfReader, PdfWriter
-        except ImportError:
-            print("⚠️ 未安装PyPDF2，无法按页裁剪PDF，继续识别全部页面")
-            return None
-
-        try:
-            reader = PdfReader(pdf_path)
-            total_pages = len(reader.pages)
-            selected_pages = self._parse_pdf_page_spec(pages_spec, total_pages)
-
-            if not selected_pages:
-                print("⚠️ PDF页码解析为空，继续识别全部页面")
-                return None
-
-            writer = PdfWriter()
-            for page_num in selected_pages:
-                writer.add_page(reader.pages[page_num - 1])
-
-            temp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-            temp_pdf_path = temp_pdf.name
-            temp_pdf.close()
-            with open(temp_pdf_path, "wb") as output_pdf:
-                writer.write(output_pdf)
-
-            print(f"✅ 使用PyPDF2 过滤PDF页面: {selected_pages}")
-            return temp_pdf_path
-        except Exception as e:
-            print(f"⚠️ 使用PyPDF2过滤PDF失败: {e}")
-            return None
-
-
-    def ocr_document(self, image_or_file, prompt: str = None, is_pdf: bool = False, pdf_pages: str = "all"):
-        """
-        文档OCR识别：使用 PaddleOCR API 直接调用
-        提取到的文字保存下来准备进行切片做RAG知识库
-        
-        Args:
-            image_or_file: 图像（PIL Image）或文件路径/字节数据
-            prompt: 自定义提示词（暂不使用，保留兼容性）
-            is_pdf: 是否为PDF文件
-            pdf_pages: PDF页码，如"all"表示所有页，"1,3,5"表示指定页
-        """
-        import os
-        import base64
-        import requests
-        import json
-        import time
-        from pathlib import Path
-        from PIL import Image
-        import tempfile
-        
-        try:
-            # 记录临时文件列表，便于统一清理
-            temp_files = []
-
-            # 确定文件路径或处理字节数据
-            file_path = None
-            
-            if isinstance(image_or_file, Image.Image):
-                # 如果是 PIL Image，需要先保存为临时文件
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    image_or_file.save(tmp.name, "PNG")
-                    file_path = tmp.name
-                    temp_files.append(tmp.name)
-            elif isinstance(image_or_file, str):
-                # 如果是文件路径
-                file_path = image_or_file
-            elif isinstance(image_or_file, bytes):
-                # 如果是字节数据（PDF或图片的字节流）
-                # 根据 is_pdf 参数确定文件扩展名
-                suffix = ".pdf" if is_pdf else ".png"
-                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                    tmp.write(image_or_file)
-                    file_path = tmp.name
-                    temp_files.append(tmp.name)
-            else:
-                return "❌ 不支持的文件类型（需要 PIL Image、文件路径或字节数据）"
-            
-            if not file_path or not os.path.exists(file_path):
-                return f"❌ 文件不存在: {file_path}"
-
-            # 如果是PDF且指定了页码，则尝试裁剪PDF
-            if (
-                (is_pdf or file_path.lower().endswith(".pdf"))
-                and pdf_pages
-                and pdf_pages.strip()
-                and pdf_pages.strip().lower() != "all"
-            ):
-                filtered_pdf = self._filter_pdf_pages(file_path, pdf_pages)
-                if filtered_pdf:
-                    file_path = filtered_pdf
-                    temp_files.append(filtered_pdf)
-                else:
-                    print("⚠️ 未能按页码裁剪PDF，继续识别全部页面")
-            
-            # 创建输出目录（用于保存OCR结果，准备RAG切片）
-            output_dir = "ocr_output"
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 读取文件并编码
-            print(f"正在读取文件: {file_path}")
-            with open(file_path, "rb") as file:
-                file_bytes = file.read()
-            file_data = base64.b64encode(file_bytes).decode("ascii")
-            
-            file_size_mb = len(file_bytes) / (1024 * 1024)
-            print(f"文件大小: {file_size_mb:.2f} MB")
-            
-            # 准备请求
-            headers = {
-                "Authorization": f"token {self.PADDLEOCR_TOKEN}",
-                "Content-Type": "application/json"
-            }
-            
-            # 根据文件类型设置 fileType
-            if is_pdf or file_path.lower().endswith('.pdf'):
-                file_type = 0  # PDF
-            else:
-                file_type = 1  # 图片
-            
-            payload = {
-                "file": file_data,
-                "fileType": file_type,
-                "useDocOrientationClassify": False,
-                "useDocUnwarping": False,
-                "useTextlineOrientation": False,
-            }
-            
-            # 发送请求
-            print("正在进行PaddleOCR识别...")
-            start_time = time.time()
-            
-            # 根据文件大小设置超时
-            timeout = max(600, int(file_size_mb * 60))
-            
-            response = requests.post(self.PADDLEOCR_API_URL, json=payload, headers=headers, timeout=timeout)
-            
-            elapsed_time = time.time() - start_time
-            print(f"响应时间: {elapsed_time:.2f}秒")
-            
-            if response.status_code != 200:
-                return f"❌ 请求失败，状态码: {response.status_code}\n响应: {response.text[:500]}"
-            
-            result = response.json()
-            
-            if "result" not in result:
-                return f"❌ 响应格式错误: {result}"
-            
-            ocr_result = result["result"]
-            ocr_results = ocr_result.get("ocrResults", [])
-            
-            if not ocr_results:
-                return "❌ 未识别到任何内容"
-            
-            # 获取输入文件名（不含扩展名）
-            input_filename = os.path.splitext(os.path.basename(file_path))[0]
-            
-            # 收集所有页面的文本内容（用于RAG切片）
-            all_text_parts = []
-            all_markdown_parts = []
-            
-            # 保存文本结果（合并所有页面）
-            txt_file = os.path.join(output_dir, f"{input_filename}_ocr.txt")
-            md_file = os.path.join(output_dir, f"{input_filename}_ocr.md")
-            json_file = os.path.join(output_dir, f"{input_filename}_ocr.json")
-            
-            with open(txt_file, "w", encoding="utf-8") as f:
-                for i, res in enumerate(ocr_results):
-                    pruned_result = res.get("prunedResult", "")
-                    formatted_result = self._format_ocr_result(pruned_result)
-                    all_text_parts.append(formatted_result)
-                    
-                    f.write(f"\n{'='*60}\n")
-                    f.write(f"第 {i + 1} 页\n")
-                    f.write(f"{'='*60}\n\n")
-                    f.write(formatted_result)
-                    f.write("\n\n")
-            
-            # 保存 Markdown 格式
-            with open(md_file, "w", encoding="utf-8") as f:
-                f.write(f"# {input_filename} OCR 结果\n\n")
-                for i, res in enumerate(ocr_results):
-                    pruned_result = res.get("prunedResult", "")
-                    formatted_result = self._format_ocr_result(pruned_result)
-                    all_markdown_parts.append(formatted_result)
-                    
-                    f.write(f"## 第 {i + 1} 页\n\n")
-                    if "\n" in formatted_result:
-                        f.write("```\n")
-                        f.write(formatted_result)
-                        f.write("\n```\n")
-                    else:
-                        f.write(formatted_result)
-                    f.write("\n\n---\n\n")
-            
-            # 保存 JSON 结果
-            with open(json_file, "w", encoding="utf-8") as f:
-                json.dump(ocr_result, f, ensure_ascii=False, indent=2)
-            
-            # 下载并保存图片（如果需要）
-            saved_images = 0
-            for i, res in enumerate(ocr_results):
-                image_url = res.get("ocrImage")
-                if image_url:
-                    try:
-                        img_response = requests.get(image_url, timeout=30)
-                        if img_response.status_code == 200:
-                            img_filename = os.path.join(output_dir, f"{input_filename}_page_{i + 1}.jpg")
-                            with open(img_filename, "wb") as f:
-                                f.write(img_response.content)
-                            saved_images += 1
-                    except:
-                        pass
-            
-            # 合并所有文本（用于RAG切片）
-            full_text = "\n\n".join(all_text_parts)
-            
-            # 保存每页的rec_texts文本（用于分页显示和RAG处理）
-            page_texts = []  # 每页的文本列表
-            for i, res in enumerate(ocr_results):
-                pruned_result = res.get("prunedResult", {})
-                if isinstance(pruned_result, dict) and "rec_texts" in pruned_result:
-                    rec_texts = pruned_result["rec_texts"]
-                    if isinstance(rec_texts, list):
-                        page_text = "\n".join(str(text) for text in rec_texts if text)
-                    else:
-                        page_text = str(rec_texts)
-                else:
-                    page_text = all_text_parts[i] if i < len(all_text_parts) else ""
-                page_texts.append(page_text)
-            
-            # 先构建并返回结果（不等待文本切片）
-            result_markdown = f"## 文档OCR识别结果\n\n"
-            result_markdown += f"### 📄 文件信息\n\n"
-            result_markdown += f"**文件名：** {input_filename}\n"
-            result_markdown += f"**文件类型：** {'PDF' if file_type == 0 else '图片'}\n"
-            result_markdown += f"**识别页数：** {len(ocr_results)}\n"
-            result_markdown += f"**处理时间：** {elapsed_time:.2f}秒\n\n"
-            
-            result_markdown += f"### 📝 识别文本（第1页，共{len(page_texts)}页）\n\n"
-            if page_texts:
-                result_markdown += f"{page_texts[0][:1000]}{'...' if len(page_texts[0]) > 1000 else ''}\n\n"
-            
-            result_markdown += f"### 💾 保存的文件\n\n"
-            result_markdown += f"- **文本文件：** `{txt_file}`\n"
-            result_markdown += f"- **Markdown文件：** `{md_file}`\n"
-            result_markdown += f"- **JSON文件：** `{json_file}`\n"
-            if saved_images > 0:
-                result_markdown += f"- **OCR图片：** {saved_images} 张\n"
-            result_markdown += f"\n### 📚 RAG准备\n\n"
-            result_markdown += f"⏳ 正在对文本进行切片处理，完成后可用于RAG相似度映射。总字符数：{len(full_text)}\n"
-            
-            # 先保存基础数据到实例变量
-            self.last_ocr_text = full_text
-            self.last_ocr_page_texts = page_texts  # 保存每页文本
-            self.last_ocr_markdown = result_markdown
-            self.last_ocr_output_dir = output_dir
-            self.last_ocr_files = {
-                'txt': txt_file,
-                'md': md_file,
-                'json': json_file
-            }
-            
-            self.last_ocr_html = "<h2>文档OCR识别结果</h2>" + self._render_sections_as_html(result_markdown)
-            
-            # 在后台进行文本切片（不阻塞返回）
-            try:
-                # 对于大文本，使用更大的切片大小以减少切片数量
-                chunk_size = 1000 if len(full_text) > 100000 else 500
-                text_chunks = self._chunk_text_for_rag(full_text, chunk_size=chunk_size, max_chunks=500)
-                print(f"✅ 文本切片完成，共 {len(text_chunks)} 个切片")
-                # 更新实例变量
-                self.last_ocr_text_chunks = text_chunks
-            except MemoryError as e:
-                print(f"⚠️ 内存不足，使用简化切片策略: {e}")
-                # 如果内存不足，使用更大的切片，减少切片数量
-                try:
-                    text_chunks = self._chunk_text_for_rag(full_text, chunk_size=2000, overlap=100, max_chunks=200)
-                    self.last_ocr_text_chunks = text_chunks
-                except:
-                    # 如果还是失败，至少保存完整文本作为一个大切片
-                    self.last_ocr_text_chunks = [full_text[:50000]] if len(full_text) > 50000 else [full_text]
-            except Exception as e:
-                print(f"⚠️ 文本切片失败: {e}")
-                # 如果切片失败，至少保存完整文本作为一个大切片
-                self.last_ocr_text_chunks = [full_text[:50000]] if len(full_text) > 50000 else [full_text]
-            
-            return result_markdown
-            
-        except requests.exceptions.Timeout:
-            return f"❌ 请求超时（超过 {timeout} 秒）"
-        except requests.exceptions.RequestException as e:
-            return f"❌ 请求失败: {e}"
-        except Exception as e:
-            import traceback
-            return f"❌ 处理过程中出现错误: {e}\n{traceback.format_exc()}"
-        finally:
-            for tmp_path in temp_files:
-                try:
-                    if tmp_path and os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-                except:
-                    pass
     
-    def extract_document_fields_with_rag(self, key_fields, custom_prompt=None):
-        """
-        识别关键字段：根据关键字段对文本切片进行相似度映射，
-        将相似度最高的三段文本提供给大模型进行信息抽取
-        
-        Args:
-            key_fields: 关键字段列表（用户自定义）
-            custom_prompt: 自定义提示词
-            
-        Returns:
-            信息抽取结果（表格形式，一个字段一行）
-        """
-        if not hasattr(self, 'last_ocr_text') or not self.last_ocr_text:
-            return "❌ 请先进行文档OCR识别"
-        
-        if not key_fields or not isinstance(key_fields, list):
-            return "❌ 请提供关键字段列表"
-        
-        # 过滤空字段
-        key_fields = [f.strip() for f in key_fields if f and f.strip()]
-        if not key_fields:
-            return "❌ 关键字段列表为空"
-        
-        try:
-            # 对每个关键字段进行RAG相似度映射（如果文本切片可用）
-            rag_context_parts = []
-            
-            if hasattr(self, 'last_ocr_text_chunks') and self.last_ocr_text_chunks:
-                print(f"🔍 开始RAG相似度匹配，共 {len(key_fields)} 个关键字段，{len(self.last_ocr_text_chunks)} 个文本切片")
-                
-                # 对每个关键字段进行RAG相似度匹配
-                field_chunks = self._rag_search_text_chunks(
-                    key_fields, 
-                    self.last_ocr_text_chunks, 
-                    top_k=3
-                )
-                
-                # 为每个字段组织相关文本切片
-                for field in key_fields:
-                    if field in field_chunks:
-                        chunks = field_chunks[field]
-                        if chunks:
-                            # 获取相似度最高的3个切片
-                            top_chunks = chunks[:3]
-                            field_texts = []
-                            for i, chunk_info in enumerate(top_chunks, 1):
-                                similarity = chunk_info['similarity']
-                                chunk_text = chunk_info['chunk_text']
-                                field_texts.append(f"[相似度: {similarity:.2%}] {chunk_text}")
-                            
-                            # 为每个字段组织相关文本
-                            field_context = f"**关键字段「{field}」的相关文本片段（相似度最高的3段）：**\n"
-                            field_context += "\n".join(field_texts)
-                            rag_context_parts.append(field_context)
-                            print(f"  ✅ {field}: 找到 {len(chunks)} 个相关片段")
-                        else:
-                            print(f"  ⚠️ {field}: 未找到相关片段")
-                    else:
-                        print(f"  ⚠️ {field}: 未找到相关片段")
-                
-                # 合并所有字段的相关文本
-                if rag_context_parts:
-                    rag_context = "\n\n".join(rag_context_parts)
-                else:
-                    # 如果没有找到相关片段，使用全文的前5000字符
-                    rag_context = f"**文档全文（前5000字符）：**\n{self.last_ocr_text[:5000]}"
-            else:
-                # 如果没有切片，使用全文的前5000字符
-                print("⚠️ 文本切片不可用，使用全文前5000字符")
-                rag_context = f"**文档全文（前5000字符）：**\n{self.last_ocr_text[:5000]}"
-            
-            # 构建提示词（要求大模型提取所有字段）
-            fields_list = "、".join([f"「{f}」" for f in key_fields])
-            default_prompt = (
-                f"你是专业的文档信息抽取专家。请从以下文档文本中提取以下关键字段的信息：{fields_list}\n\n"
-                f"**文档相关内容：**\n{rag_context}\n\n"
-                "**任务要求：**\n"
-                "1. 仔细阅读上述文档内容，特别是每个关键字段的相关文本片段\n"
-                "2. 从文档中提取每个关键字段的值\n"
-                "3. 只输出Markdown表格，格式如下：\n"
-                "| 字段名 | 字段值 |\n"
-                "|--------|--------|\n"
-                "4. 每个关键字段必须占一行，字段名和字段值都要填写\n"
-                "5. 如果某个字段在文档中找不到，字段值填写\"未找到\"\n"
-                "6. 只输出表格，不要输出其他说明文字、代码块标记或其他内容\n"
-                "7. 确保提取所有字段，不要遗漏\n"
-            )
-            
-            effective_prompt = custom_prompt if custom_prompt and custom_prompt.strip() else default_prompt
-            
-            # 使用qwen3-vl-plus API进行信息抽取
-            self._ensure_doc_api_loaded()
-            if self.doc_api is None or not self.doc_api.is_loaded:
-                return "❌ 文档OCR未加载"
-            
-            # 尝试获取第一页图像（如果有保存的OCR图像）
-            image_for_api = None
-            if hasattr(self, 'last_ocr_files') and self.last_ocr_files:
-                # 尝试加载第一页的OCR图像
-                try:
-                    from PIL import Image
-                    # 查找第一页图像
-                    output_dir = getattr(self, 'last_ocr_output_dir', 'ocr_output')
-                    import glob
-                    image_files = glob.glob(os.path.join(output_dir, '*_page_1.jpg'))
-                    if image_files:
-                        image_for_api = Image.open(image_files[0]).convert("RGB")
-                except:
-                    pass
-            
-            # 如果找不到图像，创建一个简单的占位图像或使用文本
-            try:
-                if image_for_api is None:
-                    # 创建一个简单的文本图像占位符
-                    from PIL import Image, ImageDraw, ImageFont
-                    # 创建一个白色背景的图像
-                    img = Image.new('RGB', (800, 600), color='white')
-                    draw = ImageDraw.Draw(img)
-                    # 在图像上写入提示文本
-                    try:
-                        text = "文档OCR识别结果\n请根据文本内容提取字段"
-                        draw.text((50, 50), text, fill='black')
-                    except:
-                        pass
-                    image_for_api = img
-                
-                # 调用API进行信息抽取
-                api_result = self.doc_api.recognize_card(
-                    image=image_for_api,
-                    custom_prompt=effective_prompt,
-                    max_tokens=2048,
-                    temperature=0.2,
-                    top_p=0.8,
-                    use_rag=False
-                )
-                
-                if api_result.get("success", False):
-                    response = api_result.get("result", "")
-                    print(f"✅ 大模型调用成功，响应长度: {len(response)}")
-                    # 提取表格部分
-                    table_html = self._extract_table_from_response(response)
-                    print(f"✅ 表格提取完成")
-                    return table_html
-                else:
-                    error_msg = api_result.get("error", "调用失败")
-                    print(f"❌ 调用失败: {error_msg}")
-                    return f"❌ 调用失败: {error_msg}"
-            except Exception as api_error:
-                # 如果API调用失败，返回格式化的提示词结果
-                print(f"⚠️ 调用异常: {api_error}")
-                import traceback
-                print(traceback.format_exc())
-                return f"❌ 调用失败: {str(api_error)}"
-            
-        except Exception as e:
-            import traceback
-            return f"❌ 信息抽取失败: {str(e)}\n{traceback.format_exc()}"
+
     
-    def _extract_table_from_response(self, response):
-        """
-        从大模型响应中提取表格，格式化为HTML表格（一个字段一行）
-        
-        Args:
-            response: 大模型的响应文本
-            
-        Returns:
-            HTML格式的表格
-        """
-        import re
-        import html
-        
-        # 清理响应文本，移除代码块标记
-        response = response.strip()
-        if response.startswith('```'):
-            # 移除代码块标记
-            lines = response.split('\n')
-            start_idx = 0
-            end_idx = len(lines)
-            for i, line in enumerate(lines):
-                if line.strip().startswith('```'):
-                    if i == 0:
-                        start_idx = 1
-                    else:
-                        end_idx = i
-                        break
-            response = '\n'.join(lines[start_idx:end_idx])
-        
-        # 尝试提取Markdown表格
-        # 匹配完整的表格结构：表头行 + 分隔行 + 数据行
-        all_lines = response.split('\n')
-        table_lines = []
-        in_table = False
-        header_line_idx = -1
-        separator_line_idx = -1
-        
-        # 查找表格开始位置
-        for i, line in enumerate(all_lines):
-            line_stripped = line.strip()
-            # 检查是否是表格行（包含 | 符号）
-            if '|' in line_stripped:
-                # 检查是否是分隔行（只包含 -、:、| 和空格）
-                if re.match(r'^[\s\|:\-]+$', line_stripped):
-                    if header_line_idx >= 0 and separator_line_idx < 0:
-                        # 找到分隔行
-                        separator_line_idx = i
-                        in_table = True
-                        continue
-                elif not in_table:
-                    # 可能是表头行
-                    header_line_idx = i
-                    table_lines.append(line_stripped)
-                elif in_table:
-                    # 数据行
-                    table_lines.append(line_stripped)
-            elif in_table:
-                # 表格结束
-                break
-        
-        # 如果找到了表格行，解析它们
-        if len(table_lines) > 1:
-            html_table = '<div style="margin: 20px 0;">\n'
-            html_table += '<table class="ocr-result-table" style="width: 100%; border-collapse: collapse; border: 1px solid #dee2e6; font-size: 14px;">\n'
-            html_table += '<thead><tr style="background: #f8f9fa; font-weight: 600;">'
-            html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 30%;">字段名</th>'
-            html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 70%;">字段值</th>'
-            html_table += '</tr></thead>\n<tbody>\n'
-            
-            # 解析表格行（跳过第一行表头，从数据行开始）
-            for line in table_lines[1:]:
-                # 跳过分隔行
-                if re.match(r'^[\s\|:\-]+$', line):
-                    continue
-                
-                # 分割单元格
-                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-                
-                # 如果单元格数量 >= 2，提取字段名和字段值
-                if len(cells) >= 2:
-                    # 第一个单元格是字段名，第二个是字段值
-                    field_name = cells[0].strip()
-                    field_value = cells[1].strip() if len(cells) > 1 else ""
-                    
-                    # 清理字段名和字段值（移除可能的标记符号）
-                    field_name = re.sub(r'^[-\*\s]+', '', field_name).strip()
-                    field_value = re.sub(r'^[-\*\s]+', '', field_value).strip()
-                    
-                    # 如果字段名不是"字段名"等表头关键词，才添加
-                    if field_name and field_name not in ['字段名', '字段值', 'Field Name', 'Field Value']:
-                        html_table += f'<tr>'
-                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; font-weight: 500; background: #fafbfc;">{html.escape(field_name)}</td>'
-                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; word-wrap: break-word;">{html.escape(field_value)}</td>'
-                        html_table += '</tr>\n'
-            
-            html_table += '</tbody></table>\n</div>'
-            return html_table
-        
-        # 如果没有找到标准表格，尝试提取字段名:字段值格式
-        lines = response.split('\n')
-        html_table = '<div style="margin: 20px 0;">\n'
-        html_table += '<table class="ocr-result-table" style="width: 100%; border-collapse: collapse; border: 1px solid #dee2e6; font-size: 14px;">\n'
-        html_table += '<thead><tr style="background: #f8f9fa; font-weight: 600;">'
-        html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 30%;">字段名</th>'
-        html_table += '<th style="border: 1px solid #dee2e6; padding: 12px; text-align: left; width: 70%;">字段值</th>'
-        html_table += '</tr></thead>\n<tbody>\n'
-        
-        found_rows = False
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # 跳过代码块标记和分隔行
-            if line.startswith('```') or re.match(r'^[\s\|:\-]+$', line):
-                continue
-            
-            # 尝试匹配字段名:字段值或字段名：字段值
-            if ':' in line or '：' in line:
-                parts = re.split('[:：]', line, 1)
-                if len(parts) == 2:
-                    field = parts[0].strip()
-                    value = parts[1].strip()
-                    # 清理字段名（移除可能的标记符号）
-                    field = re.sub(r'^[-\*\s]+', '', field).strip()
-                    value = re.sub(r'^[-\*\s]+', '', value).strip()
-                    if field and value:
-                        html_table += f'<tr>'
-                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; font-weight: 500; background: #fafbfc;">{html.escape(field)}</td>'
-                        html_table += f'<td style="border: 1px solid #dee2e6; padding: 12px; word-wrap: break-word;">{html.escape(value)}</td>'
-                        html_table += '</tr>\n'
-                        found_rows = True
-        
-        if not found_rows:
-            # 如果都没有找到，返回原始响应的前500字符
-            html_table += f'<tr><td colspan="2" style="border: 1px solid #dee2e6; padding: 12px; color: #dc3545;">⚠️ 无法解析响应格式，原始内容：<br/>{html.escape(response[:500])}</td></tr>\n'
-        
-        html_table += '</tbody></table>\n</div>'
-        return html_table
+    
 
     def spatial_analysis(self, image, prompt: str = None):
         """空间感知分析，可选自定义提示词"""
@@ -4428,6 +3362,7 @@ def _legacy_create_unified_interface():
         pro_task_state = gr.State("任务问答")
         media_image_state = gr.State()
         media_file_state = gr.State()
+        seal_removal_state = gr.State(False)  # 印章淡化选项状态
 
         with gr.Row(elem_id="shared-upload"):
             media_file = gr.File(
@@ -4443,6 +3378,11 @@ def _legacy_create_unified_interface():
                     interactive=False,
                     height=320,
                 )
+                seal_removal_checkbox = gr.Checkbox(
+                    label="🔄 印章淡化",
+                    value=False,
+                    info="在超分辨率处理后进行印章淡化处理"
+                )
                 media_status = gr.Markdown(value="请上传图片或PDF进行处理", elem_id="shared-status")
 
         def on_media_upload(file_path):
@@ -4454,11 +3394,21 @@ def _legacy_create_unified_interface():
             preview = media[0] if isinstance(media, list) else media
             basename = os.path.basename(file_path) if file_path else ""
             return preview, preview, file_path, f"✅ 已加载: {basename}"
+        
+        def on_seal_removal_change(checked):
+            """更新印章淡化选项状态"""
+            return checked
 
         media_file.change(
             on_media_upload,
             inputs=[media_file],
             outputs=[media_preview, media_image_state, media_file_state, media_status],
+        )
+        
+        seal_removal_checkbox.change(
+            on_seal_removal_change,
+            inputs=[seal_removal_checkbox],
+            outputs=[seal_removal_state],
         )
 
         with gr.Row(elem_id="unified-mode-bar"):
@@ -4657,7 +3607,7 @@ def _legacy_create_unified_interface():
                     return str(value)
             
             # 第一步：识别卡证类型
-            def step1_detect_type(media_image, media_file_path):
+            def step1_detect_type(media_image, media_file_path, enable_seal_removal):
                 media = media_image
                 if media is None and media_file_path:
                     loaded, err = _load_media(None, media_file_path, need_all_pages=False)
@@ -4693,7 +3643,7 @@ def _legacy_create_unified_interface():
                         "❌ 请先上传文件"
                     )
 
-                result = app.detect_card_type(media)
+                result = app.detect_card_type(media, enable_seal_removal=enable_seal_removal)
                 if len(result) == 4:
                     card_type, default_fields, html_template, status_msg = result
                 else:
@@ -4985,7 +3935,7 @@ def _legacy_create_unified_interface():
                 return dataframe_data if dataframe_data else []
             
             # 第三步：OCR识别
-            def step3_ocr(media_image, media_file_path, all_fields_df):
+            def step3_ocr(media_image, media_file_path, all_fields_df, enable_seal_removal):
                 media = media_image
                 if media is None and media_file_path:
                     loaded, err = _load_media(None, media_file_path, need_all_pages=False)
@@ -5054,7 +4004,7 @@ def _legacy_create_unified_interface():
                         gr.update(visible=False)
                     )
                 
-                result = app.ocr_card_with_fields(image, fields_list)
+                result = app.ocr_card_with_fields(image, fields_list, enable_seal_removal=enable_seal_removal)
                 
                 # 卡证OCR不使用HTML模板，只使用Markdown/DataFrame
                 # 提取Markdown文本（去掉可能的图标前缀）
@@ -5221,7 +4171,7 @@ def _legacy_create_unified_interface():
             
             detect_type_btn.click(
                 step1_detect_type,
-                inputs=[media_image_state, media_file_state],
+                inputs=[media_image_state, media_file_state, seal_removal_state],
                 outputs=[
                     card_type_output,
                     default_fields_html,
@@ -5537,7 +4487,7 @@ def _legacy_create_unified_interface():
                     )
             
             # 第一步：识别票据类型
-            def bill_step1_detect_type(media_image, media_file_path):
+            def bill_step1_detect_type(media_image, media_file_path, enable_seal_removal):
                 media = media_image
                 if media is None and media_file_path:
                     loaded, err = _load_media(None, media_file_path, need_all_pages=False)
@@ -5565,7 +4515,7 @@ def _legacy_create_unified_interface():
                         "❌ 请先上传文件"
                     )
 
-                result = app.detect_bill_type(media)
+                result = app.detect_bill_type(media, enable_seal_removal=enable_seal_removal)
                 if len(result) == 4:
                     bill_type, default_fields, html_template, status_msg = result
                 else:
@@ -5794,7 +4744,7 @@ def _legacy_create_unified_interface():
                     )
             
             # 第三步：OCR识别
-            def bill_step3_ocr(media_image, media_file_path):
+            def bill_step3_ocr(media_image, media_file_path, enable_seal_removal):
                 media = media_image
                 if media is None and media_file_path:
                     loaded, err = _load_media(None, media_file_path, need_all_pages=False)
@@ -5833,7 +4783,7 @@ def _legacy_create_unified_interface():
                         gr.update(visible=False, value="")
                     )
                 
-                result = app.ocr_bill_with_fields(image, fields_list)
+                result = app.ocr_bill_with_fields(image, fields_list, enable_seal_removal=enable_seal_removal)
                 
                 html_template = getattr(app, 'current_field_template_html', None)
                 has_html_template = html_template is not None and html_template.strip()
@@ -6314,7 +5264,7 @@ def _legacy_create_unified_interface():
             # 绑定事件
             detect_bill_type_btn.click(
                 bill_step1_detect_type,
-                inputs=[media_image_state, media_file_state],
+                inputs=[media_image_state, media_file_state, seal_removal_state],
                 outputs=[bill_type_output, bill_default_fields_html, bill_default_fields_title,
                         bill_custom_fields_input, bill_custom_fields_title, bill_add_custom_field_btn,
                         bill_update_fields_btn, bill_fields_status, bill_field_list]
@@ -6357,7 +5307,7 @@ def _legacy_create_unified_interface():
 
             bill_ocr_with_fields_btn.click(
                 bill_step3_ocr,
-                inputs=[media_image_state, media_file_state],
+                inputs=[media_image_state, media_file_state, seal_removal_state],
                 outputs=[bill_ocr_result_html, bill_ocr_result_html_edited, bill_ocr_export_format, bill_ocr_export_btn_3step, bill_ocr_export_status_3step]
             )
             
@@ -6436,6 +5386,12 @@ def _legacy_create_unified_interface():
                         label="上传卡证图片",
                         type="pil",
                         height=400
+                    )
+                    
+                    card_seal_removal_checkbox = gr.Checkbox(
+                        label="🔄 印章淡化",
+                        value=False,
+                        info="在超分辨率处理后进行印章淡化处理"
                     )
                     
                     with gr.Row():
@@ -6566,7 +5522,7 @@ def _legacy_create_unified_interface():
                     return str(value)
             
             # 第一步：识别卡证类型
-            def step1_detect_type(image):
+            def step1_detect_type(image, enable_seal_removal):
                 if image is None:
                     return (
                         gr.update(visible=False),
@@ -6583,7 +5539,7 @@ def _legacy_create_unified_interface():
                         "❌ 请先上传图片"
                     )
                 
-                result = app.detect_card_type(image)
+                result = app.detect_card_type(image, enable_seal_removal=enable_seal_removal)
                 if len(result) == 4:
                     card_type, default_fields, html_template, status_msg = result
                 else:
@@ -6875,7 +5831,7 @@ def _legacy_create_unified_interface():
                 return dataframe_data if dataframe_data else []
             
             # 第三步：OCR识别
-            def step3_ocr(image, all_fields_df):
+            def step3_ocr(image, all_fields_df, enable_seal_removal):
                 if image is None:
                     return (
                         gr.update(visible=False),
@@ -6931,7 +5887,7 @@ def _legacy_create_unified_interface():
                         gr.update(visible=False)
                     )
                 
-                result = app.ocr_card_with_fields(image, fields_list)
+                result = app.ocr_card_with_fields(image, fields_list, enable_seal_removal=enable_seal_removal)
                 
                 # 卡证OCR不使用HTML模板，只使用Markdown/DataFrame
                 # 提取Markdown文本（去掉可能的图标前缀）
@@ -7098,7 +6054,7 @@ def _legacy_create_unified_interface():
             
             detect_type_btn.click(
                 step1_detect_type,
-                inputs=[card_image],
+                inputs=[card_image, card_seal_removal_checkbox],
                 outputs=[
                     card_type_output,
                     default_fields_html,
@@ -7189,7 +6145,7 @@ def _legacy_create_unified_interface():
             
             ocr_with_fields_btn.click(
                 step3_ocr,
-                inputs=[card_image, all_fields_output],  # all_fields_output可能为空（HTML表格情况），但会从app状态获取
+                inputs=[card_image, all_fields_output, card_seal_removal_checkbox],  # all_fields_output可能为空（HTML表格情况），但会从app状态获取
                 outputs=[ocr_result_html, ocr_result, ocr_export_format, ocr_export_btn_3step, ocr_export_status_3step]
             )
             
@@ -7324,6 +6280,12 @@ def _legacy_create_unified_interface():
                         height=400
                     )
                     
+                    bill_seal_removal_checkbox = gr.Checkbox(
+                        label="🔄 印章淡化",
+                        value=False,
+                        info="在超分辨率处理后进行印章淡化处理"
+                    )
+                    
                     with gr.Row():
                         detect_bill_type_btn = gr.Button("🔍 第一步：识别票据类型", variant="primary")
                     
@@ -7423,7 +6385,7 @@ def _legacy_create_unified_interface():
                     )
             
             # 第一步：识别票据类型
-            def bill_step1_detect_type(image):
+            def bill_step1_detect_type(image, enable_seal_removal):
                 if image is None:
                     return (
                         gr.update(visible=False),
@@ -7436,7 +6398,7 @@ def _legacy_create_unified_interface():
                         "❌ 请先上传图片"
                     )
                 
-                result = app.detect_bill_type(image)
+                result = app.detect_bill_type(image, enable_seal_removal=enable_seal_removal)
                 if len(result) == 4:
                     bill_type, default_fields, html_template, status_msg = result
                 else:
@@ -7602,7 +6564,7 @@ def _legacy_create_unified_interface():
                     )
             
             # 第三步：OCR识别
-            def bill_step3_ocr(image):
+            def bill_step3_ocr(image, enable_seal_removal):
                 if image is None:
                     return (
                         gr.update(visible=False),
@@ -7627,7 +6589,7 @@ def _legacy_create_unified_interface():
                         gr.update(visible=False, value="")
                     )
                 
-                result = app.ocr_bill_with_fields(image, fields_list)
+                result = app.ocr_bill_with_fields(image, fields_list, enable_seal_removal=enable_seal_removal)
                 
                 html_template = getattr(app, 'current_field_template_html', None)
                 has_html_template = html_template is not None and html_template.strip()
@@ -8035,7 +6997,7 @@ def _legacy_create_unified_interface():
             # 绑定事件
             detect_bill_type_btn.click(
                 bill_step1_detect_type,
-                inputs=[bill_image],
+                inputs=[bill_image, bill_seal_removal_checkbox],
                 outputs=[bill_type_output, bill_default_fields_html, bill_default_fields_title, 
                         bill_custom_fields_input, bill_custom_fields_title, bill_add_custom_field_btn,
                         bill_update_fields_btn, bill_fields_status, bill_field_list]
@@ -8107,7 +7069,7 @@ def _legacy_create_unified_interface():
             
             bill_ocr_with_fields_btn.click(
                 bill_step3_ocr,
-                inputs=[bill_image],
+                inputs=[bill_image, bill_seal_removal_checkbox],
                 outputs=[bill_ocr_result_html, bill_ocr_result_html_edited, bill_ocr_export_format, bill_ocr_export_btn_3step, bill_ocr_export_status_3step]
             )
             
@@ -8170,6 +7132,12 @@ def _legacy_create_unified_interface():
                         label="上传文档（支持图片和PDF）",
                         file_types=[".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".webp"],
                         height=100
+                    )
+                    
+                    doc_seal_removal_checkbox = gr.Checkbox(
+                        label="🔄 印章淡化（仅对图片有效）",
+                        value=False,
+                        info="在超分辨率处理后进行印章淡化处理（PDF文件不处理）"
                     )
                     
                     doc_pdf_pages = gr.Textbox(
@@ -8263,9 +7231,9 @@ def _legacy_create_unified_interface():
                     )
             
             # 文档OCR识别处理函数
-            def process_doc_ocr(file, pdf_pages, custom_prompt):
+            def process_doc_ocr(file, pdf_pages, custom_prompt, enable_seal_removal):
                 print(f"[DEBUG] process_doc_ocr 被调用")
-                print(f"[DEBUG] file: {file}, pdf_pages: {pdf_pages}")
+                print(f"[DEBUG] file: {file}, pdf_pages: {pdf_pages}, enable_seal_removal: {enable_seal_removal}")
                 
                 try:
                     # 优先使用文件上传
@@ -8303,8 +7271,10 @@ def _legacy_create_unified_interface():
                         print(f"[DEBUG] 文件扩展名: {file_ext}")
                         
                         if file_ext == '.pdf':
-                            # 处理PDF
+                            # 处理PDF（不进行印章淡化处理）
                             print("[DEBUG] 开始处理PDF...")
+                            if enable_seal_removal:
+                                print("ℹ️ PDF文件不支持印章淡化处理，将直接进行OCR识别")
                             try:
                                 with open(file_path, 'rb') as f:
                                     pdf_bytes = f.read()
@@ -8336,6 +7306,13 @@ def _legacy_create_unified_interface():
                                 from PIL import Image
                                 img = Image.open(file_path).convert("RGB")
                                 print(f"[DEBUG] 图片尺寸: {img.size}")
+                                
+                                # 如果启用了印章淡化，先进行超分辨率+印章淡化处理
+                                if enable_seal_removal:
+                                    print("[DEBUG] 启用印章淡化，进行超分辨率+印章淡化处理...")
+                                    img = app._super_resolve_image_for_ocr(img, enable_seal_removal=True)
+                                    print("[DEBUG] 图片预处理完成")
+                                
                                 result = app.ocr_document(img, custom_prompt if custom_prompt and custom_prompt.strip() else None)
                                 print(f"[DEBUG] 图片处理完成，结果长度: {len(result) if result else 0}")
                             except Exception as e:
@@ -8556,81 +7533,127 @@ def _legacy_create_unified_interface():
             
             # 导出文档OCR结果
             def export_doc_ocr_result(export_format):
-                if not app.last_ocr_markdown:
-                    return gr.update(visible=True, value="❌ 没有可导出的结果！")
+                # 检查是否有OCR结果
+                if not hasattr(app, 'last_ocr_text') or not app.last_ocr_text:
+                    return gr.update(visible=True, value="❌ 没有可导出的结果！请先进行文档OCR识别。")
                 
                 try:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     export_dir = "ocr_exports"
                     os.makedirs(export_dir, exist_ok=True)
                     
+                    # 获取所有页的文本
+                    page_texts = getattr(app, 'last_ocr_page_texts', [])
+                    full_text = getattr(app, 'last_ocr_text', '')
+                    
                     if export_format == "Markdown (.md)":
                         file_name = f"doc_ocr_{timestamp}.md"
                         file_path = os.path.join(export_dir, file_name)
+                        
+                        # 生成完整的Markdown内容，包含所有页
                         with open(file_path, "w", encoding="utf-8") as f:
-                            f.write(app.last_ocr_markdown)
+                            f.write("# 文档OCR识别结果\n\n")
+                            f.write(f"**识别页数：** {len(page_texts)}\n")
+                            f.write(f"**总字符数：** {len(full_text)}\n\n")
+                            f.write("---\n\n")
+                            
+                            # 写入每一页的内容
+                            for i, page_text in enumerate(page_texts, 1):
+                                f.write(f"## 第 {i} 页\n\n")
+                                if page_text:
+                                    f.write("```\n")
+                                    f.write(page_text)
+                                    f.write("\n```\n\n")
+                                else:
+                                    f.write("（本页无内容）\n\n")
+                                f.write("---\n\n")
+                        
                         abs_file_path = os.path.abspath(file_path)
-                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Markdown文件已保存到:\n{abs_file_path}")
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Markdown文件已保存到:\n{abs_file_path}\n\n共 {len(page_texts)} 页")
+                    
                     elif export_format == "Excel (.xlsx)":
-                        # 从Markdown中提取表格数据
                         import pandas as pd
-                        lines = app.last_ocr_markdown.split('\n')
-                        table_data = []
-                        for line in lines:
-                            if '|' in line and '---' not in line:
-                                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-                                if len(cells) >= 2:
-                                    table_data.append(cells[:2])
                         
-                        if table_data:
-                            df = pd.DataFrame(table_data, columns=["字段名", "字段值"])
-                        else:
-                            df = pd.DataFrame([["内容", app.last_ocr_markdown[:500]]], columns=["字段名", "字段值"])
+                        # 创建Excel数据：每页一行
+                        excel_data = []
+                        for i, page_text in enumerate(page_texts, 1):
+                            excel_data.append({
+                                "页码": i,
+                                "内容": page_text if page_text else "（本页无内容）"
+                            })
                         
+                        # 如果没有分页数据，使用完整文本
+                        if not excel_data:
+                            excel_data.append({
+                                "页码": 1,
+                                "内容": full_text if full_text else "（无内容）"
+                            })
+                        
+                        df = pd.DataFrame(excel_data)
                         file_name = f"doc_ocr_{timestamp}.xlsx"
                         file_path = os.path.join(export_dir, file_name)
-                        df.to_excel(file_path, index=False)
+                        df.to_excel(file_path, index=False, engine='openpyxl')
                         abs_file_path = os.path.abspath(file_path)
-                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Excel文件已保存到:\n{abs_file_path}")
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Excel文件已保存到:\n{abs_file_path}\n\n共 {len(excel_data)} 页")
+                    
                     elif export_format == "CSV (.csv)":
                         import pandas as pd
-                        lines = app.last_ocr_markdown.split('\n')
-                        table_data = []
-                        for line in lines:
-                            if '|' in line and '---' not in line:
-                                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-                                if len(cells) >= 2:
-                                    table_data.append(cells[:2])
+                        import csv
                         
-                        if table_data:
-                            df = pd.DataFrame(table_data, columns=["字段名", "字段值"])
-                        else:
-                            df = pd.DataFrame([["内容", app.last_ocr_markdown[:500]]], columns=["字段名", "字段值"])
+                        # 创建CSV数据：每页一行
+                        csv_data = []
+                        for i, page_text in enumerate(page_texts, 1):
+                            csv_data.append({
+                                "页码": i,
+                                "内容": page_text if page_text else "（本页无内容）"
+                            })
                         
+                        # 如果没有分页数据，使用完整文本
+                        if not csv_data:
+                            csv_data.append({
+                                "页码": 1,
+                                "内容": full_text if full_text else "（无内容）"
+                            })
+                        
+                        df = pd.DataFrame(csv_data)
                         file_name = f"doc_ocr_{timestamp}.csv"
                         file_path = os.path.join(export_dir, file_name)
                         df.to_csv(file_path, index=False, encoding='utf-8-sig')
                         abs_file_path = os.path.abspath(file_path)
-                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 CSV文件已保存到:\n{abs_file_path}")
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 CSV文件已保存到:\n{abs_file_path}\n\n共 {len(csv_data)} 页")
+                    
                     elif export_format == "JSON (.json)":
                         import json
-                        data = {}
-                        lines = app.last_ocr_markdown.split('\n')
-                        for line in lines:
-                            if '|' in line and '---' not in line:
-                                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-                                if len(cells) >= 2:
-                                    data[cells[0]] = cells[1]
                         
-                        if not data:
-                            data = {"内容": app.last_ocr_markdown[:500]}
+                        # 创建JSON数据结构：包含所有页
+                        data = {
+                            "总页数": len(page_texts),
+                            "总字符数": len(full_text),
+                            "页面内容": []
+                        }
+                        
+                        # 添加每一页的内容
+                        for i, page_text in enumerate(page_texts, 1):
+                            data["页面内容"].append({
+                                "页码": i,
+                                "内容": page_text if page_text else "（本页无内容）",
+                                "字符数": len(page_text) if page_text else 0
+                            })
+                        
+                        # 如果没有分页数据，使用完整文本
+                        if not data["页面内容"]:
+                            data["页面内容"].append({
+                                "页码": 1,
+                                "内容": full_text if full_text else "（无内容）",
+                                "字符数": len(full_text) if full_text else 0
+                            })
                         
                         file_name = f"doc_ocr_{timestamp}.json"
                         file_path = os.path.join(export_dir, file_name)
                         with open(file_path, "w", encoding="utf-8") as f:
                             json.dump(data, f, ensure_ascii=False, indent=2)
                         abs_file_path = os.path.abspath(file_path)
-                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 JSON文件已保存到:\n{abs_file_path}")
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 JSON文件已保存到:\n{abs_file_path}\n\n共 {len(data['页面内容'])} 页")
                     else:
                         return gr.update(visible=True, value=f"❌ 不支持的导出格式: {export_format}")
                 except Exception as e:
@@ -8641,7 +7664,7 @@ def _legacy_create_unified_interface():
             
             doc_ocr_btn.click(
                 process_doc_ocr,
-                inputs=[doc_file, doc_pdf_pages, doc_custom_prompt],
+                inputs=[doc_file, doc_pdf_pages, doc_custom_prompt, doc_seal_removal_checkbox],
                 outputs=[doc_ocr_result_html, doc_page_controls, doc_ocr_export_format, doc_ocr_export_btn, doc_extract_controls, doc_ocr_export_status, doc_ocr_export_status],
                 show_progress=True
             )
