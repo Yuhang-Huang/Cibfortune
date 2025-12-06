@@ -5150,8 +5150,23 @@ def _legacy_create_unified_interface():
         with gr.Tab("📚 文档OCR识别"):
             gr.Markdown("### 完整流程：文档输入 → 文本检测 → 文本识别（全文） → 布局分析（Layout） → 字段提取（KIE） → 输出结构化数据")
             gr.Markdown("**支持格式：** 图片（JPG/PNG等）和PDF文档")
-            
-            with gr.Row():
+
+            def toggle_content(choice):
+                if choice == "全文识别":
+                    return gr.update(visible=True), gr.update(visible=False)
+                elif choice == "图文问答":
+                    return gr.update(visible=False), gr.update(visible=True)
+                # 处理空选情况
+                else:
+                    return gr.update(visible=False), gr.update(visible=False)
+
+            mode_dropdown = gr.Dropdown(
+                choices=["全文识别", "图文问答"], 
+                label="识别模式", 
+                value="全文识别"
+            )
+
+            with gr.Row(visible=True) as container_all_context:
                 with gr.Column(scale=1):
                     doc_file = gr.File(
                         label="上传文档（支持图片和PDF）",
@@ -5223,6 +5238,15 @@ def _legacy_create_unified_interface():
                         lines=3
                     )
             
+            with gr.Row(visible=False) as container_chatbot:
+                pass
+
+            mode_dropdown.change(
+                fn=toggle_content,
+                inputs=mode_dropdown,
+                outputs=[container_all_context, container_chatbot]
+            )
+
             # 文件上传变化时，更新UI显示
             def on_file_change(file):
                 if file is None:
@@ -5702,143 +5726,6 @@ def _legacy_create_unified_interface():
                 - 已默认优化为更易触摸点击的界面尺寸。
                 """
             )
-
-    return interface
-
-
-def create_unified_interface():
-    """创建精简版统一界面：仅保留图文问答，不区分通用/专业。"""
-
-    simple_css = """
-    .gradio-container {max-width: 1400px !important;}
-    #chat-panel {background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px;}
-    #input-panel {background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px;}
-    """
-
-    with gr.Blocks(
-        title="多模态图文问答",
-        theme=gr.themes.Soft(),
-        css=simple_css,
-    ) as interface:
-        gr.Markdown("## 🤖 多模态图文问答\n仅保留图文对话功能，情感/空间/批处理等高级任务已移除。")
-
-        with gr.Row():
-            load_btn = gr.Button("🔄 加载模型", variant="primary")
-            status_text = gr.Textbox(
-                label="运行状态",
-                value="⏳ 模型未加载，请点击加载模型按钮",
-                interactive=False,
-                lines=2,
-            )
-
-        load_btn.click(app.load_model, outputs=[status_text, load_btn])
-
-        with gr.Row():
-            with gr.Column(scale=1, elem_id="input-panel"):
-                image_input = gr.Image(label="上传图像", type="pil", height=360)
-                text_input = gr.Textbox(
-                    label="输入问题 / 指令",
-                    placeholder="请描述这张图片或直接提问，支持多轮上下文",
-                    lines=4,
-                )
-                with gr.Row():
-                    send_btn = gr.Button("发送", variant="primary")
-                    clear_btn = gr.Button("🗑️ 清空对话")
-
-                gr.Markdown("### 生成参数")
-                max_tokens = gr.Slider(
-                    minimum=128,
-                    maximum=4096,
-                    value=1024,
-                    step=64,
-                    label="最大生成长度",
-                )
-                temperature = gr.Slider(
-                    minimum=0.0,
-                    maximum=2.0,
-                    value=0.7,
-                    step=0.05,
-                    label="创造性 (temperature)",
-                )
-                top_p = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    value=0.8,
-                    step=0.05,
-                    label="top_p",
-                )
-                top_k = gr.Slider(
-                    minimum=1,
-                    maximum=200,
-                    value=40,
-                    step=1,
-                    label="top_k",
-                )
-                repetition_penalty = gr.Slider(
-                    minimum=0.8,
-                    maximum=2.0,
-                    value=1.0,
-                    step=0.05,
-                    label="重复惩罚 (repetition_penalty)",
-                )
-                presence_penalty = gr.Slider(
-                    minimum=0.0,
-                    maximum=2.0,
-                    value=1.5,
-                    step=0.05,
-                    label="出现惩罚 (presence_penalty)",
-                )
-
-            with gr.Column(scale=2, elem_id="chat-panel"):
-                chatbot = gr.Chatbot(
-                    label="对话历史",
-                    height=520,
-                    show_label=True,
-                    render_markdown=True,
-                    type="tuples",
-                )
-                stats_box = gr.Markdown("", label="生成信息")
-
-        def _clear_chat():
-            app.clear_history()
-            return [], "", ""
-
-        send_btn.click(
-            app.chat_with_image,
-            inputs=[
-                image_input,
-                text_input,
-                chatbot,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                presence_penalty,
-            ],
-            outputs=[chatbot, text_input, stats_box],
-        )
-
-        text_input.submit(
-            app.chat_with_image,
-            inputs=[
-                image_input,
-                text_input,
-                chatbot,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                presence_penalty,
-            ],
-            outputs=[chatbot, text_input, stats_box],
-        )
-
-        clear_btn.click(
-            _clear_chat,
-            outputs=[chatbot, text_input, stats_box],
-        )
 
     return interface
 
