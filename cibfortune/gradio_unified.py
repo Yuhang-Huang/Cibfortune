@@ -1223,7 +1223,7 @@ class AdvancedQwen3VLApp:
             # 票据OCR使用更大的max_tokens，确保能输出完整的HTML表格
             # 根据字段数量动态调整max_tokens（每个字段大约需要50-100 tokens）
             estimated_tokens = len(fields_to_extract) * 100 + 2000  # 基础2000 + 每个字段100
-            max_tokens = max(2048, min(estimated_tokens, 8192))  # 最小2048，最大8192
+            max_tokens = 8192  # 最小2048，最大8192
             
             result = self.bill_api.recognize_card(
                 image_sr,
@@ -1232,7 +1232,7 @@ class AdvancedQwen3VLApp:
                 max_tokens=max_tokens,
                 temperature=0.1,  # 降低温度，提高准确性
             )
-            
+            print(result)
             if not result.get("success"):
                 return f"❌ OCR识别失败: {result.get('error', '未知错误')}"
             
@@ -4778,7 +4778,7 @@ def _legacy_create_unified_interface():
             # 导出票据OCR结果
             def bill_export_ocr_result_3step(html_content, export_format, field_list):
                 print("[DEBUG] bill_export_ocr_result_3step called")
-                # print("[DEBUG] html content:" + html_content)
+                print("[DEBUG] html content:" + html_content)
                 # print("[DEBUG] export format:" + export_format)
                 if not html_content or not html_content.strip():
                     return gr.update(visible=True, value="❌ 没有可保存的OCR结果，请先执行OCR识别！")
@@ -5184,9 +5184,9 @@ def _legacy_create_unified_interface():
             )
             
             # JavaScript函数：在导出前从DOM读取编辑后的表格内容并更新隐藏的Textbox
-            update_hidden_textbox_js = """
+            update_fields_hidden_textbox_js = """
             function() {
-                var table = document.querySelector('.ocr-result-table');
+                var table = document.querySelector("#bill-default-fields-html");
                 if (!table) {
                     console.error('[DEBUG] 未找到表格元素');
                     return [null];
@@ -5199,7 +5199,30 @@ def _legacy_create_unified_interface():
                 var fullContent = styleContent + '\\n' + tableHtml;
                 
                 console.log('[DEBUG] 从DOM获取的表格HTML长度:', tableHtml.length);
-                console.log('[DEBUG] 表格内容预览:', tableHtml.substring(0, 200));
+                console.log('[DEBUG] 表格内容预览:', tableHtml.substring(0, 300));
+                console.log('[DEBUG] 准备返回编辑后的内容，长度:', fullContent.length);
+                
+                // 返回编辑后的内容，Gradio会自动更新bill_ocr_result_html_edited组件
+                return [fullContent];
+            }
+            """
+
+            update_hidden_textbox_js = """
+            function() {
+                var table = document.querySelector('#bill-ocr-result-html');
+                if (!table) {
+                    console.error('[DEBUG] 未找到表格元素');
+                    return [null];
+                }
+                
+                // 获取编辑后的表格HTML（包含所有用户编辑的内容）
+                var styleTag = document.querySelector('style');
+                var styleContent = styleTag ? styleTag.outerHTML : '';
+                var tableHtml = table.outerHTML;
+                var fullContent = styleContent + '\\n' + tableHtml;
+                
+                console.log('[DEBUG] 从DOM获取的表格HTML长度:', tableHtml.length);
+                console.log('[DEBUG] 表格内容预览:', tableHtml.substring(0, 300));
                 console.log('[DEBUG] 准备返回编辑后的内容，长度:', fullContent.length);
                 
                 // 返回编辑后的内容，Gradio会自动更新bill_ocr_result_html_edited组件
@@ -5211,7 +5234,7 @@ def _legacy_create_unified_interface():
                 fn=lambda x: x,  # 简单的匿名函数：输入什么，返回什么
                 inputs=[bill_default_fields_html_edited], # 占位，确保参数数量匹配
                 outputs=[bill_default_fields_html_edited], 
-                js=update_hidden_textbox_js
+                js=update_fields_hidden_textbox_js
             ).then(
                 bill_step2_update_fields,
                 inputs=[bill_type_output, bill_custom_fields_input, bill_default_fields_html_edited],
@@ -5241,8 +5264,15 @@ def _legacy_create_unified_interface():
                     return html_content
                 return ""
             
+            def sync2_edited_html(html_content):
+                print("bill_ocr_result_html.change!!")
+                print(html_content)
+                if html_content:
+                    return html_content
+                return ""
+
             bill_ocr_result_html.change(
-                sync_edited_html,
+                sync2_edited_html,
                 inputs=[bill_ocr_result_html],
                 outputs=[bill_ocr_result_html_edited]
             )
@@ -5988,6 +6018,120 @@ def main():
         debug=True,
         show_error=True,
     )
+
+def batch_output(ocr_type, DATASET_PATH="./tests/dataset", RESULT_PATH="./tests/ans"):
+    from pathlib import Path
+    import json
+    app = AdvancedQwen3VLApp()
+
+    def card_scan_dir(folder_path, output_json_path):
+        input_dir = Path(folder_path)
+        if not input_dir.exists():
+            print(f"错误: 文件夹 {folder_path} 不存在")
+            return
+
+        # 支持的图片格式
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        files = [f for f in input_dir.iterdir() if f.suffix.lower() in valid_extensions]
+        total_files = len(files)
+        data_list = []
+
+        for index, file_path in enumerate(files, 1):
+            file_name = file_path.name
+            image = Image.open(folder_path+'/'+file_name)
+            result = app.detect_card_type(image, enable_seal_removal=False)
+            if len(result) == 4:
+                card_type, default_fields, html_template, status_msg = result
+            else:
+                # 兼容旧版本（没有HTML模板）
+                card_type, default_fields, status_msg = result
+                html_template = None
+            res = app.ocr_card_with_fields(image, default_fields, enable_seal_removal=False)
+            if res.startswith("🪪"):
+                markdown_text = res.split(":", 1)[1].strip() if ":" in res else res
+            else:
+                markdown_text = res
+            
+            # 保存到app状态以便导出
+            app.last_ocr_markdown = f"## 卡证OCR识别结果（三步流程）\n\n{markdown_text}"
+            
+            # 解析OCR结果，提取字段值字典
+            ocr_data = {}
+            sections = app._parse_markdown_sections(markdown_text)
+            for section in sections:
+                if section["type"] == "table":
+                    rows = section.get("rows", [])
+                    for row in rows:
+                        if len(row) >= 2:
+                            field_name = str(row[0]).strip()
+                            field_value = str(row[1]).strip()
+                            if field_name:
+                                ocr_data[field_name] = field_value
+            
+            # 卡证OCR不使用HTML模板，只使用DataFrame
+            # 将OCR结果转换为DataFrame格式
+            temp = {}
+            for field_name, field_value in ocr_data.items():
+                temp[field_name] = field_value
+            data_list.append({"filename":file_name, "res": temp})
+            # res = app.get_dict_from_html(html_content)
+            # data_list.append({"filename":file_name, "res": res})
+
+
+    
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump(data_list, f, ensure_ascii=False, indent=2)
+
+    def bill_scan_dir(folder_path, output_json_path):
+        input_dir = Path(folder_path)
+        if not input_dir.exists():
+            print(f"错误: 文件夹 {folder_path} 不存在")
+            return
+
+        # 支持的图片格式
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        files = [f for f in input_dir.iterdir() if f.suffix.lower() in valid_extensions]
+        total_files = len(files)
+        data_list = []
+
+        for index, file_path in enumerate(files, 1):
+            file_name = file_path.name
+            image = Image.open(folder_path+'/'+file_name)
+            print(folder_path+'/'+file_name)
+            detected_type, default_fields, html_template, _ = app.detect_bill_type(image, enable_seal_removal=False)
+            html_content = app.ocr_bill_with_fields(image, default_fields)
+            res = app.get_dict_from_html(html_content)
+            data_list.append({"filename":file_name, "res": res})
+
+        
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump(data_list, f, ensure_ascii=False, indent=2)
+
+    base_folder = Path(DATASET_PATH)
+    type = "银行承兑汇票"
+    subdirs = [item.name for item in base_folder.iterdir() if item.is_dir()]
+
+    if ocr_type == "card":
+        if not type:
+            for subdir in subdirs:
+                INPUT_FOLDER = f"{DATASET_PATH}/{ocr_type}/{subdir}"
+                OUTPUT_FILE = f"{RESULT_PATH}/{ocr_type}/{subdir}_ans.json"
+                card_scan_dir(INPUT_FOLDER, OUTPUT_FILE)
+        else:
+            INPUT_FOLDER = f"{DATASET_PATH}/{ocr_type}/{type}"
+            OUTPUT_FILE = f"{RESULT_PATH}/{ocr_type}/{type}_ans.json"
+            card_scan_dir(INPUT_FOLDER, OUTPUT_FILE)
+
+    elif ocr_type == "bill":
+        if not type:
+            for subdir in subdirs:
+                INPUT_FOLDER = f"{DATASET_PATH}/{ocr_type}/{subdir}"
+                OUTPUT_FILE = f"{RESULT_PATH}/{ocr_type}/{subdir}_ans.json"
+                bill_scan_dir(INPUT_FOLDER, OUTPUT_FILE)
+        else:
+            INPUT_FOLDER = f"{DATASET_PATH}/{ocr_type}/{type}"
+            OUTPUT_FILE = f"{RESULT_PATH}/{ocr_type}/{type}_ans.json"
+            bill_scan_dir(INPUT_FOLDER, OUTPUT_FILE)
 
 
 if __name__ == "__main__":

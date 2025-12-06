@@ -24,14 +24,14 @@ EDITABLE_TABLE_TEMPLATE = """
             }}
 
             /* 核心表格样式 */
-            table.ocr-result-table {{
+            table.ocr-field-table {{
                 border-collapse: collapse; /* 合并边框，必须有 */
                 margin: 0 auto;
                 /* 如果你想覆盖原始的 width，可以在这里加 !important，否则保留原始宽度 */
             }}
 
             /* 单元格样式 */
-            table.ocr-result-table td, table.ocr-result-table th {{
+            table.ocr-field-table td, table.ocr-field-table th {{
                 border: 1px solid #333; /* 实线边框 */
                 padding: 8px 12px;
                 text-align: center;
@@ -90,7 +90,7 @@ body {
     color: var(--text-primary);
 }
 .gradio-container {
-    max-width: 1650px !important;
+    width: 1650px !important;
     margin: 0 auto;
     padding: 20px 24px 48px;
     font-size: 16px;

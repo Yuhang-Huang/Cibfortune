@@ -113,6 +113,8 @@ def show_interface_menu():
     print("")
     print("2. 检查系统状态")
     print("3. 安装依赖")
+    print("4. 批量卡证识别（无GUI）")
+    print("5. 批量单据识别（无GUI）")
     print("0. 退出")
     print("="*60)
 
@@ -191,6 +193,18 @@ def main():
                 print("✅ 依赖安装完成")
             else:
                 print("❌ 依赖安装失败")
+        elif choice == "4":
+            try:
+                from gradio_unified import batch_output
+                batch_output("card")
+            except Exception as e:
+                print(f"❌ 卡证批量识别失败: {e}")
+        elif choice == "5":
+            try:
+                from gradio_unified import batch_output
+                batch_output("bill")
+            except Exception as e:
+                print(f"❌ 单据批量识别失败: {e}")
         else:
             print("❌ 无效选项，请重新选择")
         

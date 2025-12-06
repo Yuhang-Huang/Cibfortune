@@ -8,3 +8,5 @@ cibfortune/models/*
 cibfortune/chat_history
 cibfortune/ocr_output/*
 cibfortune/tests/dataset
+cibfortune/tests/ans
+cibfortune/tests/res
