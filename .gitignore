@@ -7,3 +7,4 @@ cibfortune/models/*
 .DS_Store
 cibfortune/chat_history
 cibfortune/ocr_output/*
+cibfortune/tests/dataset

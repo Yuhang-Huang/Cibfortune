@@ -10224,6 +10224,576 @@ def _legacy_create_unified_interface():
                 outputs=[bill_ocr_export_status_3step]
             )
 
+        with gr.Tab("📚 文档OCR识别"):
+            gr.Markdown("### 完整流程：文档输入 → 文本检测 → 文本识别（全文） → 布局分析（Layout） → 字段提取（KIE） → 输出结构化数据")
+            gr.Markdown("**支持格式：** 图片（JPG/PNG等）和PDF文档")
+
+            def toggle_content(choice):
+                if choice == "全文识别":
+                    return gr.update(visible=True), gr.update(visible=False)
+                elif choice == "图文问答":
+                    return gr.update(visible=False), gr.update(visible=True)
+                # 处理空选情况
+                else:
+                    return gr.update(visible=False), gr.update(visible=False)
+
+            mode_dropdown = gr.Dropdown(
+                choices=["全文识别", "图文问答"], 
+                label="识别模式", 
+                value="全文识别"
+            )
+
+            with gr.Row(visible=True) as container_all_context:
+                with gr.Column(scale=1):
+                    doc_file = gr.File(
+                        label="上传文档（支持图片和PDF）",
+                        file_types=[".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".webp"],
+                        height=400
+                    )
+                    
+                    doc_seal_removal_checkbox = gr.Checkbox(
+                        label="🔄 印章淡化（仅对图片有效）",
+                        value=False,
+                        info="在超分辨率处理后进行印章淡化处理（PDF文件不处理）"
+                    )
+                    
+                    doc_pdf_pages = gr.Textbox(
+                        label="PDF页码（可选，留空处理所有页，如：1,3,5）",
+                        placeholder="留空处理所有页，或输入页码如：1,3,5",
+                        visible=False
+                    )
+                    
+                    with gr.Row():
+                        doc_ocr_btn = gr.Button("🚀 开始文档OCR识别", variant="primary")
+                
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        gr.Markdown("### 📊 OCR识别结果")
+                        with gr.Column(scale=1, min_width=200):
+                            doc_ocr_export_format = gr.Dropdown(
+                                choices=["Markdown (.md)", "Excel (.xlsx)", "CSV (.csv)", "JSON (.json)"],
+                                value="Markdown (.md)",
+                                label="导出格式",
+                                visible=False
+                            )
+                        doc_ocr_export_btn = gr.Button("💾 导出结果", variant="secondary", visible=False, size="sm")
+                    
+                    # 分页控制
+                    with gr.Row(visible=False) as doc_page_controls:
+                        doc_page_prev_btn = gr.Button("⬅️ 上一页", variant="secondary", size="sm")
+                        doc_page_info = gr.Markdown("第 1 页 / 共 1 页", elem_id="doc-page-info")
+                        doc_page_next_btn = gr.Button("下一页 ➡️", variant="secondary", size="sm")
+                    
+                    doc_ocr_result_html = gr.HTML(
+                        label="OCR识别结果",
+                        visible=False,
+                        elem_id="doc-ocr-result-html"
+                    )
+                    
+                    # 关键字段输入和信息抽取（OCR识别完成后显示）
+                    with gr.Row(visible=False) as doc_extract_controls:
+                        with gr.Column():
+                            gr.Markdown("### 🔍 关键字段识别")
+                            doc_key_fields = gr.Textbox(
+                                label="关键字段（每行一个，用于RAG相似度映射）",
+                                placeholder="例如：\n合同编号\n甲方\n乙方\n签订日期",
+                                lines=5,
+                                interactive=True
+                            )
+                            doc_extract_btn = gr.Button("🔍 识别关键字段", variant="primary")
+                    
+                    doc_extract_result = gr.HTML(
+                        label="信息抽取结果",
+                        visible=False,
+                        elem_id="doc-extract-result"
+                    )
+                    
+                    doc_ocr_export_status = gr.Textbox(
+                        label="导出状态",
+                        interactive=False,
+                        visible=False,
+                        lines=3
+                    )
+            
+            with gr.Row(visible=False) as container_chatbot:
+                pass
+
+            mode_dropdown.change(
+                fn=toggle_content,
+                inputs=mode_dropdown,
+                outputs=[container_all_context, container_chatbot]
+            )
+
+            # 文件上传变化时，更新UI显示
+            def on_file_change(file):
+                if file is None:
+                    return (
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+                
+                file_path = file.name if hasattr(file, 'name') else file
+                file_ext = os.path.splitext(file_path)[1].lower()
+                
+                if file_ext == '.pdf':
+                    return (
+                        gr.update(visible=False),
+                        gr.update(visible=True),
+                        gr.update(value="")
+                    )
+                else:
+                    return (
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+            
+            # 文档OCR识别处理函数
+            def process_doc_ocr(file, pdf_pages, enable_seal_removal):
+                print(f"[DEBUG] process_doc_ocr 被调用")
+                print(f"[DEBUG] file: {file}, pdf_pages: {pdf_pages}, enable_seal_removal: {enable_seal_removal}")
+                
+                try:
+                    # 优先使用文件上传
+                    if file is not None:
+                        file_path = file.name if hasattr(file, 'name') else file
+                        print(f"[DEBUG] 文件路径: {file_path}")
+                        
+                        if not file_path:
+                            error_msg = "❌ 请上传文档文件或图片！"
+                            print(f"[DEBUG] {error_msg}")
+                            return (
+                                gr.update(visible=False),
+                                gr.update(visible=False),  # 分页控件
+                                gr.update(visible=False),  # 导出格式
+                                gr.update(visible=False),  # 导出按钮
+                                gr.update(visible=False),  # 信息抽取控件
+                                gr.update(visible=True, value=error_msg),
+                                error_msg
+                            )
+                        
+                        if not os.path.exists(file_path):
+                            error_msg = f"❌ 文件不存在: {file_path}"
+                            print(f"[DEBUG] {error_msg}")
+                            return (
+                                gr.update(visible=False),
+                                gr.update(visible=False),  # 分页控件
+                                gr.update(visible=False),  # 导出格式
+                                gr.update(visible=False),  # 导出按钮
+                                gr.update(visible=False),  # 信息抽取控件
+                                gr.update(visible=True, value=error_msg),
+                                error_msg
+                            )
+                        
+                        file_ext = os.path.splitext(file_path)[1].lower()
+                        print(f"[DEBUG] 文件扩展名: {file_ext}")
+                        
+                        if file_ext == '.pdf':
+                            # 处理PDF（不进行印章淡化处理）
+                            print("[DEBUG] 开始处理PDF...")
+                            if enable_seal_removal:
+                                print("ℹ️ PDF文件不支持印章淡化处理，将直接进行OCR识别")
+                            try:
+                                with open(file_path, 'rb') as f:
+                                    pdf_bytes = f.read()
+                                print(f"[DEBUG] PDF文件大小: {len(pdf_bytes)} 字节")
+                                result = app.ocr_document(
+                                    pdf_bytes, 
+                                    None,
+                                    is_pdf=True,
+                                    pdf_pages=pdf_pages if pdf_pages and pdf_pages.strip() else "all"
+                                )
+                                print(f"[DEBUG] PDF处理完成，结果长度: {len(result) if result else 0}")
+                            except Exception as e:
+                                import traceback
+                                error_msg = f"❌ PDF处理失败: {str(e)}"
+                                print(f"[DEBUG] PDF处理异常: {traceback.format_exc()}")
+                                return (
+                                    gr.update(visible=False),
+                                    gr.update(visible=False),  # 分页控件
+                                    gr.update(visible=False),  # 导出格式
+                                    gr.update(visible=False),  # 导出按钮
+                                    gr.update(visible=False),  # 信息抽取控件
+                                    gr.update(visible=True, value=error_msg),
+                                    error_msg
+                                )
+                        else:
+                            # 处理图片文件
+                            print("[DEBUG] 开始处理图片文件...")
+                            try:
+                                from PIL import Image
+                                img = Image.open(file_path).convert("RGB")
+                                print(f"[DEBUG] 图片尺寸: {img.size}")
+                                
+                                # 如果启用了印章淡化，先进行超分辨率+印章淡化处理
+                                if enable_seal_removal:
+                                    print("[DEBUG] 启用印章淡化，进行超分辨率+印章淡化处理...")
+                                    img = app._super_resolve_image_for_ocr(img, enable_seal_removal=True)
+                                    print("[DEBUG] 图片预处理完成")
+                                
+                                result = app.ocr_document(img, None)
+                                print(f"[DEBUG] 图片处理完成，结果长度: {len(result) if result else 0}")
+                            except Exception as e:
+                                import traceback
+                                error_msg = f"❌ 图片处理失败: {str(e)}"
+                                print(f"[DEBUG] 图片处理异常: {traceback.format_exc()}")
+                                return (
+                                    gr.update(visible=False),
+                                    gr.update(visible=False),  # 分页控件
+                                    gr.update(visible=False),  # 导出格式
+                                    gr.update(visible=False),  # 导出按钮
+                                    gr.update(visible=False),  # 信息抽取控件
+                                    gr.update(visible=True, value=error_msg),
+                                    error_msg
+                                )
+                    else:
+                        error_msg = "❌ 请上传文档文件！"
+                        print(f"[DEBUG] {error_msg}")
+                        return (
+                            gr.update(visible=False),
+                            gr.update(visible=False),  # 分页控件
+                            gr.update(visible=False),  # 导出格式
+                            gr.update(visible=False),  # 导出按钮
+                            gr.update(visible=False),  # 信息抽取控件
+                            gr.update(visible=True, value=error_msg),
+                            error_msg
+                        )
+                    
+                    if result is None:
+                        error_msg = "❌ 处理失败，未返回结果"
+                        print(f"[DEBUG] {error_msg}")
+                        return (
+                            gr.update(visible=False),
+                            gr.update(visible=False),  # 分页控件
+                            gr.update(visible=False),  # 导出格式
+                            gr.update(visible=False),  # 导出按钮
+                            gr.update(visible=False),  # 信息抽取控件
+                            gr.update(visible=True, value=error_msg),
+                            error_msg
+                        )
+                    
+                    if result.startswith("❌"):
+                        print(f"[DEBUG] 处理失败: {result}")
+                        return (
+                            gr.update(visible=False),
+                            gr.update(visible=False),  # 分页控件
+                            gr.update(visible=False),  # 导出格式
+                            gr.update(visible=False),  # 导出按钮
+                            gr.update(visible=False),  # 信息抽取控件
+                            gr.update(visible=True, value=result),
+                            result
+                        )
+                    
+                    print("[DEBUG] 准备返回结果...")
+                    # 获取第一页的文本用于显示
+                    page_texts = getattr(app, 'last_ocr_page_texts', [])
+                    if page_texts:
+                        # 显示第一页
+                        first_page_text = page_texts[0]
+                        page_count = len(page_texts)
+                        page_html = f"""
+                        <div style="padding: 20px; background: #f8f9fa; border-radius: 8px;">
+                            <h3>第 1 页 / 共 {page_count} 页</h3>
+                            <div style="background: white; padding: 15px; border-radius: 6px; margin-top: 10px; white-space: pre-wrap; font-family: monospace; max-height: 600px; overflow-y: auto;">
+                                {html.escape(first_page_text)}
+                            </div>
+                        </div>
+                        """
+                    else:
+                        page_html = app.last_ocr_html or _plain_text_to_html(app.last_ocr_markdown or "")
+                    
+                    print(f"[DEBUG] HTML长度: {len(page_html) if page_html else 0}, 页数: {len(page_texts) if page_texts else 0}")
+                    
+                    # 如果有多个页面，显示分页控件
+                    show_page_controls = len(page_texts) > 1
+                    # 关键字段输入框在OCR识别完成后就显示（不依赖页数）
+                    show_extract_controls = True
+                    
+                    return (
+                        gr.update(value=page_html, visible=True),
+                        gr.update(visible=show_page_controls),  # 分页控件
+                        gr.update(visible=True),  # 导出格式
+                        gr.update(visible=True),  # 导出按钮
+                        gr.update(visible=show_extract_controls),  # 信息抽取控件（关键字段输入）
+                        gr.update(visible=True, value="✅ 文档OCR识别完成，可导出结果"),
+                        "✅ 文档OCR识别完成，可导出结果"
+                    )
+                except Exception as e:
+                    import traceback
+                    error_msg = f"❌ 处理失败: {str(e)}"
+                    print(f"[DEBUG] 异常: {traceback.format_exc()}")
+                    return (
+                        gr.update(visible=False),
+                        gr.update(visible=False),  # 分页控件
+                        gr.update(visible=False),  # 导出格式
+                        gr.update(visible=False),  # 导出按钮
+                        gr.update(visible=False),  # 信息抽取控件
+                        gr.update(visible=True, value=error_msg),
+                        error_msg
+                    )
+            
+            # 文件上传变化时，更新UI显示（文档OCR）
+            def on_file_change(file):
+                if file is None:
+                    return (
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+                
+                file_path = file.name if hasattr(file, 'name') else file
+                file_ext = os.path.splitext(file_path)[1].lower()
+                
+                if file_ext == '.pdf':
+                    return (
+                        gr.update(visible=True),
+                        gr.update(value="")
+                    )
+                else:
+                    return (
+                        gr.update(visible=False),
+                        gr.update(value="")
+                    )
+            
+            # 分页切换函数
+            def change_doc_page(direction):
+                """切换文档页面（direction: 'prev' 或 'next'）"""
+                page_texts = getattr(app, 'last_ocr_page_texts', [])
+                if not page_texts:
+                    return (
+                        gr.update(value="❌ 没有可显示的页面", visible=True),
+                        gr.update(value="第 0 页 / 共 0 页"),
+                        gr.update(),
+                        gr.update()
+                    )
+                
+                # 从页面信息中获取当前页码（使用隐藏状态）
+                current_page = getattr(app, '_current_doc_page', 0)
+                
+                if direction == 'prev':
+                    current_page = max(0, current_page - 1)
+                elif direction == 'next':
+                    current_page = min(len(page_texts) - 1, current_page + 1)
+                
+                app._current_doc_page = current_page
+                page_count = len(page_texts)
+                page_text = page_texts[current_page]
+                
+                page_html = f"""
+                <div style="padding: 20px; background: #f8f9fa; border-radius: 8px;">
+                    <h3>第 {current_page + 1} 页 / 共 {page_count} 页</h3>
+                    <div style="background: white; padding: 15px; border-radius: 6px; margin-top: 10px; white-space: pre-wrap; font-family: monospace; max-height: 600px; overflow-y: auto;">
+                        {html.escape(page_text)}
+                    </div>
+                </div>
+                """
+                
+                page_info = f"第 {current_page + 1} 页 / 共 {page_count} 页"
+                
+                return (
+                    gr.update(value=page_html, visible=True),
+                    gr.update(value=page_info),
+                    gr.update(interactive=current_page > 0),  # 上一页按钮
+                    gr.update(interactive=current_page < page_count - 1)  # 下一页按钮
+                )
+            
+            # 信息抽取函数
+            def extract_doc_fields(key_fields_text):
+                """根据关键字段进行信息抽取，返回表格格式"""
+                if not key_fields_text or not key_fields_text.strip():
+                    return gr.update(value="❌ 请输入关键字段", visible=True)
+                
+                # 解析关键字段（每行一个）
+                key_fields = [f.strip() for f in key_fields_text.strip().split('\n') if f.strip()]
+                
+                if not key_fields:
+                    return gr.update(value="❌ 关键字段列表为空", visible=True)
+                
+                try:
+                    result = app.extract_document_fields_with_rag(key_fields)
+                    # 如果结果是HTML表格，直接使用；否则转换为HTML
+                    if result.startswith('<table') or result.startswith('<div'):
+                        result_html = result
+                    else:
+                        # 检查是否包含表格
+                        if '<table' in result:
+                            result_html = result
+                        else:
+                            result_html = _plain_text_to_html(result)
+                    return gr.update(value=result_html, visible=True)
+                except Exception as e:
+                    import traceback
+                    error_msg = f"❌ 信息抽取失败: {str(e)}\n{traceback.format_exc()}"
+                    return gr.update(value=_plain_text_to_html(error_msg), visible=True)
+            
+            doc_file.change(
+                on_file_change,
+                inputs=[doc_file],
+                outputs=[doc_pdf_pages, doc_pdf_pages]
+            )
+            
+            # 绑定分页按钮事件
+            doc_page_prev_btn.click(
+                lambda: change_doc_page('prev'),
+                outputs=[doc_ocr_result_html, doc_page_info, doc_page_prev_btn, doc_page_next_btn]
+            )
+            
+            doc_page_next_btn.click(
+                lambda: change_doc_page('next'),
+                outputs=[doc_ocr_result_html, doc_page_info, doc_page_prev_btn, doc_page_next_btn]
+            )
+            
+            # 绑定信息抽取按钮事件
+            doc_extract_btn.click(
+                extract_doc_fields,
+                inputs=[doc_key_fields],
+                outputs=[doc_extract_result]
+            )
+            
+            # 导出文档OCR结果
+            def export_doc_ocr_result(export_format):
+                # 检查是否有OCR结果
+                if not hasattr(app, 'last_ocr_text') or not app.last_ocr_text:
+                    return gr.update(visible=True, value="❌ 没有可导出的结果！请先进行文档OCR识别。")
+                
+                try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    export_dir = "ocr_exports"
+                    os.makedirs(export_dir, exist_ok=True)
+                    
+                    # 获取所有页的文本
+                    page_texts = getattr(app, 'last_ocr_page_texts', [])
+                    full_text = getattr(app, 'last_ocr_text', '')
+                    
+                    if export_format == "Markdown (.md)":
+                        file_name = f"doc_ocr_{timestamp}.md"
+                        file_path = os.path.join(export_dir, file_name)
+                        
+                        # 生成完整的Markdown内容，包含所有页
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write("# 文档OCR识别结果\n\n")
+                            f.write(f"**识别页数：** {len(page_texts)}\n")
+                            f.write(f"**总字符数：** {len(full_text)}\n\n")
+                            f.write("---\n\n")
+                            
+                            # 写入每一页的内容
+                            for i, page_text in enumerate(page_texts, 1):
+                                f.write(f"## 第 {i} 页\n\n")
+                                if page_text:
+                                    f.write("```\n")
+                                    f.write(page_text)
+                                    f.write("\n```\n\n")
+                                else:
+                                    f.write("（本页无内容）\n\n")
+                                f.write("---\n\n")
+                        
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Markdown文件已保存到:\n{abs_file_path}\n\n共 {len(page_texts)} 页")
+                    
+                    elif export_format == "Excel (.xlsx)":
+                        import pandas as pd
+                        
+                        # 创建Excel数据：每页一行
+                        excel_data = []
+                        for i, page_text in enumerate(page_texts, 1):
+                            excel_data.append({
+                                "页码": i,
+                                "内容": page_text if page_text else "（本页无内容）"
+                            })
+                        
+                        # 如果没有分页数据，使用完整文本
+                        if not excel_data:
+                            excel_data.append({
+                                "页码": 1,
+                                "内容": full_text if full_text else "（无内容）"
+                            })
+                        
+                        df = pd.DataFrame(excel_data)
+                        file_name = f"doc_ocr_{timestamp}.xlsx"
+                        file_path = os.path.join(export_dir, file_name)
+                        df.to_excel(file_path, index=False, engine='openpyxl')
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 Excel文件已保存到:\n{abs_file_path}\n\n共 {len(excel_data)} 页")
+                    
+                    elif export_format == "CSV (.csv)":
+                        import pandas as pd
+                        import csv
+                        
+                        # 创建CSV数据：每页一行
+                        csv_data = []
+                        for i, page_text in enumerate(page_texts, 1):
+                            csv_data.append({
+                                "页码": i,
+                                "内容": page_text if page_text else "（本页无内容）"
+                            })
+                        
+                        # 如果没有分页数据，使用完整文本
+                        if not csv_data:
+                            csv_data.append({
+                                "页码": 1,
+                                "内容": full_text if full_text else "（无内容）"
+                            })
+                        
+                        df = pd.DataFrame(csv_data)
+                        file_name = f"doc_ocr_{timestamp}.csv"
+                        file_path = os.path.join(export_dir, file_name)
+                        df.to_csv(file_path, index=False, encoding='utf-8-sig')
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 CSV文件已保存到:\n{abs_file_path}\n\n共 {len(csv_data)} 页")
+                    
+                    elif export_format == "JSON (.json)":
+                        import json
+                        
+                        # 创建JSON数据结构：包含所有页
+                        data = {
+                            "总页数": len(page_texts),
+                            "总字符数": len(full_text),
+                            "页面内容": []
+                        }
+                        
+                        # 添加每一页的内容
+                        for i, page_text in enumerate(page_texts, 1):
+                            data["页面内容"].append({
+                                "页码": i,
+                                "内容": page_text if page_text else "（本页无内容）",
+                                "字符数": len(page_text) if page_text else 0
+                            })
+                        
+                        # 如果没有分页数据，使用完整文本
+                        if not data["页面内容"]:
+                            data["页面内容"].append({
+                                "页码": 1,
+                                "内容": full_text if full_text else "（无内容）",
+                                "字符数": len(full_text) if full_text else 0
+                            })
+                        
+                        file_name = f"doc_ocr_{timestamp}.json"
+                        file_path = os.path.join(export_dir, file_name)
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        abs_file_path = os.path.abspath(file_path)
+                        return gr.update(visible=True, value=f"✅ 导出成功！\n📄 JSON文件已保存到:\n{abs_file_path}\n\n共 {len(data['页面内容'])} 页")
+                    else:
+                        return gr.update(visible=True, value=f"❌ 不支持的导出格式: {export_format}")
+                except Exception as e:
+                    import traceback
+                    error_msg = f"❌ 导出失败: {str(e)}\n{traceback.format_exc()}"
+                    print(error_msg)
+                    return gr.update(visible=True, value=error_msg)
+            
+            doc_ocr_btn.click(
+                process_doc_ocr,
+                inputs=[doc_file, doc_pdf_pages, doc_seal_removal_checkbox],
+                outputs=[doc_ocr_result_html, doc_page_controls, doc_ocr_export_format, doc_ocr_export_btn, doc_extract_controls, doc_ocr_export_status, doc_ocr_export_status],
+                show_progress=True
+            )
+            
+            doc_ocr_export_btn.click(
+                export_doc_ocr_result,
+                inputs=[doc_ocr_export_format],
+                outputs=[doc_ocr_export_status]
+            )
+
         with gr.Tab("ℹ️ 使用说明"):
             gr.Markdown(
                 """
@@ -10233,143 +10803,6 @@ def _legacy_create_unified_interface():
                 - 已默认优化为更易触摸点击的界面尺寸。
                 """
             )
-
-    return interface
-
-
-def create_unified_interface():
-    """创建精简版统一界面：仅保留图文问答，不区分通用/专业。"""
-
-    simple_css = """
-    .gradio-container {max-width: 1400px !important;}
-    #chat-panel {background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px;}
-    #input-panel {background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px;}
-    """
-
-    with gr.Blocks(
-        title="多模态图文问答",
-        theme=gr.themes.Soft(),
-        css=simple_css,
-    ) as interface:
-        gr.Markdown("## 🤖 多模态图文问答\n仅保留图文对话功能，情感/空间/批处理等高级任务已移除。")
-
-        with gr.Row():
-            load_btn = gr.Button("🔄 加载模型", variant="primary")
-            status_text = gr.Textbox(
-                label="运行状态",
-                value="⏳ 模型未加载，请点击加载模型按钮",
-                interactive=False,
-                lines=2,
-            )
-
-        load_btn.click(app.load_model, outputs=[status_text, load_btn])
-
-        with gr.Row():
-            with gr.Column(scale=1, elem_id="input-panel"):
-                image_input = gr.Image(label="上传图像", type="pil", height=360)
-                text_input = gr.Textbox(
-                    label="输入问题 / 指令",
-                    placeholder="请描述这张图片或直接提问，支持多轮上下文",
-                    lines=4,
-                )
-                with gr.Row():
-                    send_btn = gr.Button("发送", variant="primary")
-                    clear_btn = gr.Button("🗑️ 清空对话")
-
-                gr.Markdown("### 生成参数")
-                max_tokens = gr.Slider(
-                    minimum=128,
-                    maximum=4096,
-                    value=1024,
-                    step=64,
-                    label="最大生成长度",
-                )
-                temperature = gr.Slider(
-                    minimum=0.0,
-                    maximum=2.0,
-                    value=0.7,
-                    step=0.05,
-                    label="创造性 (temperature)",
-                )
-                top_p = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    value=0.8,
-                    step=0.05,
-                    label="top_p",
-                )
-                top_k = gr.Slider(
-                    minimum=1,
-                    maximum=200,
-                    value=40,
-                    step=1,
-                    label="top_k",
-                )
-                repetition_penalty = gr.Slider(
-                    minimum=0.8,
-                    maximum=2.0,
-                    value=1.0,
-                    step=0.05,
-                    label="重复惩罚 (repetition_penalty)",
-                )
-                presence_penalty = gr.Slider(
-                    minimum=0.0,
-                    maximum=2.0,
-                    value=1.5,
-                    step=0.05,
-                    label="出现惩罚 (presence_penalty)",
-                )
-
-            with gr.Column(scale=2, elem_id="chat-panel"):
-                chatbot = gr.Chatbot(
-                    label="对话历史",
-                    height=520,
-                    show_label=True,
-                    render_markdown=True,
-                    type="tuples",
-                )
-                stats_box = gr.Markdown("", label="生成信息")
-
-        def _clear_chat():
-            app.clear_history()
-            return [], "", ""
-
-        send_btn.click(
-            app.chat_with_image,
-            inputs=[
-                image_input,
-                text_input,
-                chatbot,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                presence_penalty,
-            ],
-            outputs=[chatbot, text_input, stats_box],
-        )
-
-        text_input.submit(
-            app.chat_with_image,
-            inputs=[
-                image_input,
-                text_input,
-                chatbot,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                presence_penalty,
-            ],
-            outputs=[chatbot, text_input, stats_box],
-        )
-
-        clear_btn.click(
-            _clear_chat,
-            outputs=[chatbot, text_input, stats_box],
-        )
 
     return interface
 
