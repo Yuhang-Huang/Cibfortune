@@ -4,18 +4,108 @@ import time
 import json
 import pandas as pd
 from pathlib import Path
+import openai
 import os
+from PIL import Image
+from io import BytesIO
 
-def get_image_base64(image_path):
+def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     """
-    读取图片并转换为Base64字符串
+    将PIL Image转换为base64编码的字符串
+    
+    Args:
+        image: PIL Image对象
+        format: 图片格式，默认PNG
+        
+    Returns:
+        base64编码的图片字符串（data URI格式）
     """
-    with open(image_path, 'rb') as f:
-        # 读取文件内容
-        image_data = f.read()
-        # 转换为base64并解码为utf-8字符串
-        base64_str = base64.b64encode(image_data).decode('utf8')
-    return base64_str
+    buffer = BytesIO()
+    image.save(buffer, format=format)
+    img_bytes = buffer.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+    
+    # 根据格式确定MIME类型
+    mime_types = {
+        "PNG": "image/png",
+        "JPEG": "image/jpeg",
+        "JPG": "image/jpeg",
+        "WEBP": "image/webp"
+    }
+    mime_type = mime_types.get(format.upper(), "image/png")
+    
+    return f"data:{mime_type};base64,{img_base64}"
+
+def recognize_card(
+    image_base64,
+    api_url,
+    token,
+    max_tokens: int = 1024,
+    temperature: float = 0.3,
+    top_p: float = 0.8,
+) :
+    prompt = f"你是专业的票据OCR引擎。请仔细阅读并识别输入图片中的所有内容，并生成相应的HTML表格，需使用rowspan和colspan维持空间结构，禁止输出其他任何内容。\n"
+    
+    # 准备Qwen API消息格式（兼容OpenAI格式）
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_base64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
+        }
+    ]
+    
+    
+    # 调用Qwen API（在线模式）
+    try:
+        client_kwargs = {
+            "api_key": token,
+            "base_url": api_url
+        }
+        client = openai.OpenAI(**client_kwargs)
+        start_time = time.time()
+        
+        # 准备API参数
+        api_params = {
+            "model": "qwen3-vl-plus",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        
+        # top_p参数：如果小于1.0则添加，否则不传（使用默认值）
+        if top_p < 1.0:
+            api_params["top_p"] = top_p
+        
+        response = client.chat.completions.create(**api_params)
+        
+        generation_time = time.time() - start_time
+        
+        # 提取响应文本
+        result_text = response.choices[0].message.content
+        
+        print(result_text)
+        return {
+            "success": True,
+            "result": result_text,
+            "generation_time": generation_time,
+            "error": None
+        }
+        
+    except Exception as e:
+        print(e)
+
+
 
 def ocr_via_api(folder_path, output_json_path, api_url, token):
     """
@@ -33,11 +123,6 @@ def ocr_via_api(folder_path, output_json_path, api_url, token):
     
     # 用于存储所有结果的列表
     data_list = []
-    
-    headers = {
-        "Authorization": f"token {token}",
-        "Content-Type": "application/json"
-    }
 
     print(f"连接 API 地址: {api_url}")
     print(f"开始处理 {total_files} 个文件...")
@@ -48,45 +133,19 @@ def ocr_via_api(folder_path, output_json_path, api_url, token):
         
         try:
             # 1. 准备 Base64 数据
-            img_b64 = get_image_base64(file_path)
+            img_b64 = image_to_base64(Image.open(file_path))
             
-            payload = {
-                "file": img_b64,
-                "fileType": 1,
-                "useDocOrientationClassify": False,
-                "useDocUnwarping": False,
-                "useTextlineOrientation": False,
-            }
-            
-            # 2. 发送请求并计时
-            start_time = time.time()
-            response = requests.post(url=api_url, headers=headers, data=json.dumps(payload))
-            end_time = time.time()
-            
-            elapsed_time = round(end_time - start_time, 4) # 保留4位小数
-            
-            # 3. 解析响应
-            resp_json = response.json()
-            
-            # 安全解析逻辑
-            ocr_result = resp_json.get("result", {})
-            ocr_results_list = ocr_result.get("ocrResults", [])
-            
-            if ocr_results_list:
-                # 提取 rec_texts
-                res = ocr_results_list[0]['prunedResult']['rec_texts']
-            else:
-                res = [] # 如果没识别到内容，返回空列表
+            res = recognize_card(img_b64, api_url, token)
 
             # 4. 【修改点】收集成功的数据
             result_item = {
                 "filename": file_name,
-                "result": res,         # 识别结果列表
-                "time": elapsed_time   # 耗时
+                "result": res["result"],         # 识别结果列表
+                "time": res["generation_time"]   # 耗时
             }
             data_list.append(result_item)
             
-            print(f" 完成 (耗时 {elapsed_time:.2f}s)")
+            print(f" 完成 (耗时 {res["generation_time"]:.2f}s)")
 
         except requests.exceptions.ConnectionError:
             print(" 失败! 无法连接到服务器。")
@@ -124,8 +183,8 @@ if __name__ == "__main__":
     # --- 配置区域 ---
     # 你的 PaddleHub 服务地址
     # 如果是本地默认启动，通常是 http://127.0.0.1:8866/predict/ch_pp-ocrv3
-    API_URL = "https://g8e2x4l851qer5i3.aistudio-app.com/ocr"
-    TOKEN = "0143529bb9cf856a58a342760f5bdc39a85e13b4"
+    API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    TOKEN = "sk-7236eb30f8c94bfdb7113c89f907b490"
     DATASET_PATH = "./dataset"
     RESULT_PATH = "./res"
     
@@ -138,7 +197,7 @@ if __name__ == "__main__":
     if not type:
         for subdir in subdirs:
             INPUT_FOLDER = f"{DATASET_PATH}/{subdir}"
-            OUTPUT_FILE = f"{RESULT_PATH}/{subdir}_baseline_paddleocr.json"
+            OUTPUT_FILE = f"{RESULT_PATH}/{subdir}_baseline_qwenvl.json"
 
             # 自动创建测试文件夹
             Path(INPUT_FOLDER).mkdir(exist_ok=True)
@@ -147,7 +206,7 @@ if __name__ == "__main__":
     #test specified type
     else:
         INPUT_FOLDER = f"{DATASET_PATH}/{type}"
-        OUTPUT_FILE = f"{RESULT_PATH}/{type}_baseline_paddleocr.json"
+        OUTPUT_FILE = f"{RESULT_PATH}/{type}_baseline_qwenvl.json"
 
         # 自动创建测试文件夹
         Path(INPUT_FOLDER).mkdir(exist_ok=True)
