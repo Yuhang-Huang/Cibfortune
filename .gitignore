@@ -6,4 +6,4 @@ cibfortune/ocr_exports
 cibfortune/models/*
 .DS_Store
 cibfortune/chat_history
-
+cibfortune/ocr_output/*
