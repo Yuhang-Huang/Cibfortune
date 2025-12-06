@@ -2196,6 +2196,56 @@ class AdvancedQwen3VLApp:
         self.chat_messages.extend([user_message, assistant_message])
         return prompt_clean, response, generation_time
 
+    def _generate_text_with_local_model(self, prompt, max_tokens=2048, temperature=0.2, top_p=0.8, top_k=40, repetition_penalty=1.0):
+        """
+        使用本地加载的 Qwen3-VL 模型生成文本，供文档字段抽取使用。
+        """
+        if torch is None:
+            return None, "? 本地模型不可用：未检测到 PyTorch"
+        if not self.is_loaded or self.model is None or self.processor is None:
+            return None, "? 本地模型未加载，请先点击加载模型按钮"
+
+        prompt_clean = (prompt or "").strip()
+        if not prompt_clean:
+            return None, "? 提示词不可为空"
+
+        try:
+            messages = [
+                {"role": "user", "content": [{"type": "text", "text": prompt_clean}]}
+            ]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            ).to(self.model.device)
+
+            generation_kwargs = {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "do_sample": True if temperature > 0 else False,
+                "repetition_penalty": repetition_penalty
+            }
+
+            with torch.no_grad():
+                generated_ids = self.model.generate(**inputs, **generation_kwargs)
+
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            return output_text[0], None
+        except Exception as e:
+            import traceback
+            print(f"? 本地模型推理失败: {e}")
+            traceback.print_exc()
+            return None, f"? 本地模型推理失败: {e}"
+
     def _clone_history(self, history):
         return [[turn[0], turn[1]] for turn in history]
 
@@ -7435,6 +7485,162 @@ class AdvancedQwen3VLApp:
         html_table += '</tbody></table>\n</div>'
         return html_table
 
+    def extract_document_fields_with_rag(self, key_fields, custom_prompt=None):
+        """
+        识别关键字段：根据关键字段对文本切片进行相似度映射，
+        将相似度最高的三段文本提供给大模型进行信息抽取
+        
+        Args:
+            key_fields: 关键字段列表（用户自定义）
+            custom_prompt: 自定义提示词
+            
+        Returns:
+            信息抽取结果（表格形式，一个字段一行）
+        """
+        if not hasattr(self, 'last_ocr_text') or not self.last_ocr_text:
+            return "? 请先进行文档OCR识别"
+        
+        if not key_fields or not isinstance(key_fields, list):
+            return "? 请提供关键字段列表"
+        
+        key_fields = [f.strip() for f in key_fields if f and f.strip()]
+        if not key_fields:
+            return "? 关键字段列表为空"
+
+        try:
+            rag_context_parts = []
+            if hasattr(self, 'last_ocr_text_chunks') and self.last_ocr_text_chunks:
+                print(f"?? 开始RAG相似度匹配，共 {len(key_fields)} 个关键字段，{len(self.last_ocr_text_chunks)} 个文本切片")
+                field_chunks = self._rag_search_text_chunks(
+                    key_fields,
+                    self.last_ocr_text_chunks,
+                    top_k=3
+                )
+                for field in key_fields:
+                    if field in field_chunks:
+                        chunks = field_chunks[field]
+                        if chunks:
+                            top_chunks = chunks[:3]
+                            field_texts = []
+                            for i, chunk_info in enumerate(top_chunks, 1):
+                                similarity = chunk_info['similarity']
+                                chunk_text = chunk_info['chunk_text']
+                                field_texts.append(f"[相似度: {similarity:.2%}] {chunk_text}")
+                            field_context = f"**关键字段「{field}」的相关文本片段（相似度最高的3段）：**\n"
+                            field_context += "\n".join(field_texts)
+                            rag_context_parts.append(field_context)
+                            print(f"  ? {field}: 找到 {len(chunks)} 个相关片段")
+                        else:
+                            print(f"  ?? {field}: 未找到相关片段")
+                    else:
+                        print(f"  ?? {field}: 未找到相关片段")
+                if rag_context_parts:
+                    rag_context = "\n\n".join(rag_context_parts)
+                else:
+                    rag_context = f"**文档全文（前5000字符）：**\n{self.last_ocr_text[:5000]}"
+            else:
+                print("?? 文本切片不可用，使用全文前5000字符")
+                rag_context = f"**文档全文（前5000字符）：**\n{self.last_ocr_text[:5000]}"
+
+            fields_list = "、".join([f"「{f}」" for f in key_fields])
+            default_prompt = (
+                f"你是专业的文档信息抽取专家。请从以下文档文本中提取以下关键字段的信息：{fields_list}\n\n"
+                f"**文档相关内容：**\n{rag_context}\n\n"
+                "**任务要求：**\n"
+                "1. 仔细阅读上述文档内容，特别是每个关键字段的相关文本片段\n"
+                "2. 从文档中提取每个关键字段的值\n"
+                "3. 只输出Markdown表格，格式如下：\n"
+                "| 字段名 | 字段值 |\n"
+                "|--------|--------|\n"
+                "4. 每个关键字段必须占一行，字段名和字段值都要填写\n"
+                "5. 如果某个字段在文档中找不到，字段值填写\"未找到\"\n"
+                "6. 只输出表格，不要输出其他说明文字、代码块标记或其他内容\n"
+                "7. 确保提取所有字段，不要遗漏\n"
+            )
+            
+            effective_prompt = custom_prompt if custom_prompt and custom_prompt.strip() else default_prompt
+
+            self._ensure_doc_api_loaded()
+            api_error = None
+            if self.doc_api is None or not self.doc_api.is_loaded:
+                api_error = "? 文档OCR未加载"
+            else:
+                image_for_api = None
+                if hasattr(self, 'last_ocr_files') and self.last_ocr_files:
+                    try:
+                        from PIL import Image
+                        output_dir = getattr(self, 'last_ocr_output_dir', 'ocr_output')
+                        import glob
+                        image_files = glob.glob(os.path.join(output_dir, '*_page_1.jpg'))
+                        if image_files:
+                            image_for_api = Image.open(image_files[0]).convert("RGB")
+                    except:
+                        pass
+
+                if image_for_api is None:
+                    try:
+                        from PIL import Image, ImageDraw, ImageFont
+                        img = Image.new('RGB', (800, 600), color='white')
+                        draw = ImageDraw.Draw(img)
+                        try:
+                            text = "文档OCR识别结果\n请根据文本内容提取字段"
+                            draw.text((50, 50), text, fill='black')
+                        except:
+                            pass
+                        image_for_api = img
+                    except:
+                        image_for_api = None
+
+                if image_for_api is not None:
+                    try:
+                        api_result = self.doc_api.recognize_card(
+                            image=image_for_api,
+                            custom_prompt=effective_prompt,
+                            max_tokens=2048,
+                            temperature=0.2,
+                            top_p=0.8,
+                            use_rag=False
+                        )
+
+                        if api_result.get("success", False):
+                            response = api_result.get("result", "")
+                            print(f"? 大模型调用成功，响应长度: {len(response)}")
+                            table_html = self._extract_table_from_response(response)
+                            print(f"? 表格提取完成")
+                            return table_html
+                        else:
+                            error_msg = api_result.get("error", "调用失败")
+                            print(f"? 调用失败: {error_msg}")
+                            api_error = f"? 调用失败: {error_msg}"
+                    except Exception as api_exc:
+                        print(f"? 调用异常: {api_exc}")
+                        import traceback
+                        print(traceback.format_exc())
+                        api_error = f"? 调用失败: {api_exc}"
+                else:
+                    api_error = "? 无法生成用于API调用的图像"
+
+            local_response, local_error = self._generate_text_with_local_model(
+                effective_prompt,
+                max_tokens=2048,
+                temperature=0.2,
+                top_p=0.8
+            )
+            if local_response:
+                print(f"? 本地模型调用成功，响应长度: {len(local_response)}")
+                table_html = self._extract_table_from_response(local_response)
+                print(f"? 表格提取完成")
+                return table_html
+
+            fallback_msg = local_error or "? 本地模型解析失败"
+            if api_error:
+                fallback_msg = f"{api_error}\n{fallback_msg}"
+            return fallback_msg
+
+        except Exception as e:
+            import traceback
+            return f"? 信息抽取失败: {str(e)}\n{traceback.format_exc()}"
+
     def export_chat_history(self):
         """导出对话历史"""
         if not self.chat_history:
@@ -7873,6 +8079,23 @@ def _legacy_create_unified_interface():
     }
     #doc-upload-card .gradio-radio {
         margin-top: 8px;
+    }
+    #doc-preview-column {
+        border-radius: 18px;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        background: #ffffff;
+        overflow: hidden;
+        max-height: 260px;
+        padding: 10px;
+        box-shadow: 0 12px 24px rgba(15, 23, 42, 0.09);
+    }
+    #doc-preview-column .doc-preview-image {
+        width: 100% !important;
+        height: 240px !important;
+        object-fit: cover;
+        object-position: top center;
+        border-radius: 12px;
+        display: block;
     }
     #unified-header-row {
         display: flex;
@@ -10245,7 +10468,7 @@ def _legacy_create_unified_interface():
                             )
                             ocr_engine_selector = gr.Radio(
                                 label="文档OCR引擎",
-                                choices=["Qwen3-VL（本地）", "PaddleOCR API"],
+                                choices=["Qwen3-VL（本地）", "传统OCR识别"],
                                 value="Qwen3-VL（本地）",
                                 interactive=True,
                                 elem_id="doc-ocr-engine"
@@ -10254,13 +10477,21 @@ def _legacy_create_unified_interface():
                                 value="请上传文件，自动完成预览与OCR",
                                 elem_id="shared-status"
                             )
-                        with gr.Column(scale=1):
-                            media_preview = gr.Image(
-                                label="预览（PDF取首页）",
-                                type="pil",
-                                interactive=False,
-                                height=320,
-                            )
+                            with gr.Column(
+                                scale=1,
+                                elem_id="doc-preview-column"
+                            ):
+                                media_preview = gr.Image(
+                                    label="预览（PDF取首页，顶部截取）",
+                                    type="pil",
+                                    interactive=False,
+                                    height=320,
+                                    elem_classes="doc-preview-image",
+                                )
+                                gr.Markdown(
+                                    "仅展示顶部内容，若需要全部可下载原文查看。",
+                                    elem_classes="text-xs",
+                                )
                             doc_ocr_preview = gr.HTML(
                                 label="自动OCR预览（上传即识别）",
                                 value="",
@@ -10275,19 +10506,6 @@ def _legacy_create_unified_interface():
                 )
 
                 with gr.Row(equal_height=True):
-                    with gr.Column(scale=1):
-                        with gr.Group(elem_id="unified-input-panel"):
-                            with gr.Row(equal_height=True):
-                                max_tokens = gr.Slider(minimum=512, maximum=16384, value=4096, label="最大生成长度 (out_seq_length)")
-                                temperature = gr.Slider(minimum=0.0, maximum=2.0, value=0.7, label="创造性 (temperature)")
-                            gr.Markdown("ℹ️ 上方上传并自动预览/识别，直接在此提问即可。")
-
-                            with gr.Accordion("🎛️ 高级参数", open=False, visible=True):
-                                top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.8, label="top_p")
-                                top_k = gr.Slider(minimum=0, maximum=100, value=20, label="top_k")
-                                repetition_penalty = gr.Slider(minimum=0.8, maximum=2.0, value=1.0, step=0.05, label="repetition_penalty")
-                                presence_penalty = gr.Slider(minimum=0.0, maximum=3.0, value=1.5, step=0.1, label="presence_penalty")
-
                     with gr.Column(scale=2):
                         with gr.Group(elem_id="unified-chat-panel"):
                             gr.Markdown("### 图文问答")
@@ -10298,6 +10516,17 @@ def _legacy_create_unified_interface():
                                 doc_clear_btn = gr.Button("🗑️ 清空历史", variant="secondary", scale=1)
                             doc_stats_output = gr.HTML(value="", visible=False, elem_id="unified-stats")
 
+                with gr.Accordion("🔧 参数配置", open=False, elem_id="unified-params"):
+                    with gr.Row(equal_height=True):
+                        max_tokens = gr.Slider(minimum=512, maximum=16384, value=4096, label="最大生成长度 (out_seq_length)")
+                        temperature = gr.Slider(minimum=0.0, maximum=2.0, value=0.7, label="创造性 (temperature)")
+                    gr.Markdown("ℹ️ 上方上传并自动预览/识别，直接在此提问即可。")
+
+                    with gr.Accordion("🎛️ 高级参数", open=False, visible=True):
+                        top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.8, label="top_p")
+                        top_k = gr.Slider(minimum=0, maximum=100, value=20, label="top_k")
+                        repetition_penalty = gr.Slider(minimum=0.8, maximum=2.0, value=1.0, step=0.05, label="repetition_penalty")
+                        presence_penalty = gr.Slider(minimum=0.0, maximum=3.0, value=1.5, step=0.1, label="presence_penalty")
                 doc_send_btn.click(
                     handle_unified_chat,
                     inputs=[media_image_state, media_file_state, doc_text_input, doc_chatbot, max_tokens, temperature, top_p, top_k, pro_task_state, repetition_penalty, presence_penalty],
