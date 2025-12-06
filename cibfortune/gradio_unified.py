@@ -8236,90 +8236,7 @@ def _legacy_create_unified_interface():
 
         load_btn.click(app.load_model, outputs=[status_text, load_btn])
 
-        with gr.Tab("📚 文档图文问答"):
-            with gr.Group(elem_id="doc-upload-card"):
-                gr.Markdown("#### 📂 上传文档并即时预览")
-                with gr.Row(equal_height=True):
-                    with gr.Column(scale=1):
-                        media_file = gr.File(
-                            label="选择图片或PDF（取首页预览）",
-                            file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp"],
-                            type="filepath",
-                            height=90,
-                        )
-                        ocr_engine_selector = gr.Radio(
-                            label="文档OCR引擎",
-                            choices=["Qwen3-VL（本地）", "PaddleOCR API"],
-                            value="Qwen3-VL（本地）",
-                            interactive=True,
-                            elem_id="doc-ocr-engine"
-                        )
-                        media_status = gr.Markdown(
-                            value="请上传文件，自动完成预览与OCR",
-                            elem_id="shared-status"
-                        )
-                    with gr.Column(scale=1):
-                        media_preview = gr.Image(
-                            label="预览（PDF取首页）",
-                            type="pil",
-                            interactive=False,
-                            height=320,
-                        )
-                        doc_ocr_preview = gr.HTML(
-                            label="自动OCR预览（上传即识别）",
-                            value="",
-                            visible=False,
-                            elem_id="doc-ocr-preview"
-                        )
-
-            media_file.change(
-                on_media_upload,
-                inputs=[media_file, ocr_engine_selector],
-                outputs=[media_preview, media_image_state, media_file_state, media_status, doc_ocr_preview],
-            )
-
-            with gr.Row(equal_height=True):
-                with gr.Column(scale=1):
-                    with gr.Group(elem_id="unified-input-panel"):
-                        with gr.Row(equal_height=True):
-                            max_tokens = gr.Slider(minimum=512, maximum=16384, value=4096, label="最大生成长度 (out_seq_length)")
-                            temperature = gr.Slider(minimum=0.0, maximum=2.0, value=0.7, label="创造性 (temperature)")
-                        gr.Markdown("ℹ️ 上方上传并自动预览/识别，直接在此提问即可。")
-
-                        with gr.Accordion("🎛️ 高级参数", open=False, visible=True):
-                            top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.8, label="top_p")
-                            top_k = gr.Slider(minimum=0, maximum=100, value=20, label="top_k")
-                            repetition_penalty = gr.Slider(minimum=0.8, maximum=2.0, value=1.0, step=0.05, label="repetition_penalty")
-                            presence_penalty = gr.Slider(minimum=0.0, maximum=3.0, value=1.5, step=0.1, label="presence_penalty")
-
-                with gr.Column(scale=2):
-                    with gr.Group(elem_id="unified-chat-panel"):
-                        gr.Markdown("### 图文问答")
-                        doc_chatbot = gr.Chatbot(label=None, height=520, show_label=False, type="tuples", elem_id="unified-chatbot", render_markdown=True)
-                        doc_text_input = gr.Textbox(label=None, placeholder="输入你想了解的内容，支持直接就文档/图片发问。", lines=3, elem_id="unified-query")
-                        with gr.Row():
-                            doc_send_btn = gr.Button("发送", variant="primary", scale=1)
-                            doc_clear_btn = gr.Button("🗑️ 清空历史", variant="secondary", scale=1)
-                        doc_stats_output = gr.HTML(value="", visible=False, elem_id="unified-stats")
-
-            doc_send_btn.click(
-                handle_unified_chat,
-                inputs=[media_image_state, media_file_state, doc_text_input, doc_chatbot, max_tokens, temperature, top_p, top_k, pro_task_state, repetition_penalty, presence_penalty],
-                outputs=[doc_chatbot, doc_text_input, doc_stats_output],
-            )
-            doc_text_input.submit(
-                handle_unified_chat,
-                inputs=[media_image_state, media_file_state, doc_text_input, doc_chatbot, max_tokens, temperature, top_p, top_k, pro_task_state, repetition_penalty, presence_penalty],
-                outputs=[doc_chatbot, doc_text_input, doc_stats_output],
-            )
-            def _clear_doc_session():
-                app.clear_history()
-                return [], "", gr.update(value="", visible=False)
-
-            doc_clear_btn.click(
-                _clear_doc_session,
-                outputs=[doc_chatbot, doc_text_input, doc_stats_output],
-            )
+        
         with gr.Tab("🪪 卡证OCR（三步流程）"):
             gr.Markdown("### 三步流程：识别类型 → 自定义字段 → OCR识别")
             
@@ -10316,7 +10233,89 @@ def _legacy_create_unified_interface():
                     )
             
             with gr.Row(visible=False) as container_chatbot:
-                pass
+                with gr.Group(elem_id="doc-upload-card"):
+                    gr.Markdown("#### 📂 上传文档并即时预览")
+                    with gr.Row(equal_height=True):
+                        with gr.Column(scale=1):
+                            media_file = gr.File(
+                                label="选择图片或PDF（取首页预览）",
+                                file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp"],
+                                type="filepath",
+                                height=90,
+                            )
+                            ocr_engine_selector = gr.Radio(
+                                label="文档OCR引擎",
+                                choices=["Qwen3-VL（本地）", "PaddleOCR API"],
+                                value="Qwen3-VL（本地）",
+                                interactive=True,
+                                elem_id="doc-ocr-engine"
+                            )
+                            media_status = gr.Markdown(
+                                value="请上传文件，自动完成预览与OCR",
+                                elem_id="shared-status"
+                            )
+                        with gr.Column(scale=1):
+                            media_preview = gr.Image(
+                                label="预览（PDF取首页）",
+                                type="pil",
+                                interactive=False,
+                                height=320,
+                            )
+                            doc_ocr_preview = gr.HTML(
+                                label="自动OCR预览（上传即识别）",
+                                value="",
+                                visible=False,
+                                elem_id="doc-ocr-preview"
+                            )
+
+                media_file.change(
+                    on_media_upload,
+                    inputs=[media_file, ocr_engine_selector],
+                    outputs=[media_preview, media_image_state, media_file_state, media_status, doc_ocr_preview],
+                )
+
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=1):
+                        with gr.Group(elem_id="unified-input-panel"):
+                            with gr.Row(equal_height=True):
+                                max_tokens = gr.Slider(minimum=512, maximum=16384, value=4096, label="最大生成长度 (out_seq_length)")
+                                temperature = gr.Slider(minimum=0.0, maximum=2.0, value=0.7, label="创造性 (temperature)")
+                            gr.Markdown("ℹ️ 上方上传并自动预览/识别，直接在此提问即可。")
+
+                            with gr.Accordion("🎛️ 高级参数", open=False, visible=True):
+                                top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.8, label="top_p")
+                                top_k = gr.Slider(minimum=0, maximum=100, value=20, label="top_k")
+                                repetition_penalty = gr.Slider(minimum=0.8, maximum=2.0, value=1.0, step=0.05, label="repetition_penalty")
+                                presence_penalty = gr.Slider(minimum=0.0, maximum=3.0, value=1.5, step=0.1, label="presence_penalty")
+
+                    with gr.Column(scale=2):
+                        with gr.Group(elem_id="unified-chat-panel"):
+                            gr.Markdown("### 图文问答")
+                            doc_chatbot = gr.Chatbot(label=None, height=520, show_label=False, type="tuples", elem_id="unified-chatbot", render_markdown=True)
+                            doc_text_input = gr.Textbox(label=None, placeholder="输入你想了解的内容，支持直接就文档/图片发问。", lines=3, elem_id="unified-query")
+                            with gr.Row():
+                                doc_send_btn = gr.Button("发送", variant="primary", scale=1)
+                                doc_clear_btn = gr.Button("🗑️ 清空历史", variant="secondary", scale=1)
+                            doc_stats_output = gr.HTML(value="", visible=False, elem_id="unified-stats")
+
+                doc_send_btn.click(
+                    handle_unified_chat,
+                    inputs=[media_image_state, media_file_state, doc_text_input, doc_chatbot, max_tokens, temperature, top_p, top_k, pro_task_state, repetition_penalty, presence_penalty],
+                    outputs=[doc_chatbot, doc_text_input, doc_stats_output],
+                )
+                doc_text_input.submit(
+                    handle_unified_chat,
+                    inputs=[media_image_state, media_file_state, doc_text_input, doc_chatbot, max_tokens, temperature, top_p, top_k, pro_task_state, repetition_penalty, presence_penalty],
+                    outputs=[doc_chatbot, doc_text_input, doc_stats_output],
+                )
+                def _clear_doc_session():
+                    app.clear_history()
+                    return [], "", gr.update(value="", visible=False)
+
+                doc_clear_btn.click(
+                    _clear_doc_session,
+                    outputs=[doc_chatbot, doc_text_input, doc_stats_output],
+                )
 
             mode_dropdown.change(
                 fn=toggle_content,
