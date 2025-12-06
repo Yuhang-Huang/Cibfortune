@@ -8249,7 +8249,7 @@ def _legacy_create_unified_interface():
                         )
                         ocr_engine_selector = gr.Radio(
                             label="文档OCR引擎",
-                            choices=["Qwen3-VL（本地）", "传统OCR识别"],
+                            choices=["Qwen3-VL（本地）", "PaddleOCR API"],
                             value="Qwen3-VL（本地）",
                             interactive=True,
                             elem_id="doc-ocr-engine"
