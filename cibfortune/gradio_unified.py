@@ -1328,7 +1328,7 @@ class AdvancedQwen3VLApp:
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_path,
                 dtype="auto",
-                device_map="cuda",
+                device_map="cuda:2",
                 load_in_4bit=False,
             )
 
@@ -2740,7 +2740,190 @@ class AdvancedQwen3VLApp:
                         os.unlink(tmp_path)
                 except:
                     pass
-    
+    def _ocr_document_qwen3(self, image_or_file, prompt: str = None, pdf_pages: str = "all"):
+        """使用Qwen3-VL进行文档OCR，并将结果切片后写入知识库。"""
+        import os
+        import time
+        import json
+        from pathlib import Path
+
+        if not self.is_loaded:
+            return "❌ 请先加载模型"
+
+        start_time = time.time()
+        default_prompt = (
+            "请识别这份文档中的全部文字内容，保持原始阅读顺序。"
+            "对于表格或列表，请使用Markdown表格或列表输出，不要使用代码块。"
+        )
+        effective_prompt = (prompt or "").strip() or default_prompt
+
+        output_dir = "ocr_output"
+        os.makedirs(output_dir, exist_ok=True)
+
+        input_filename = "document"
+        is_pdf = False
+        pages = []
+
+        if isinstance(image_or_file, str):
+            input_filename = Path(image_or_file).stem
+            is_pdf = image_or_file.lower().endswith(".pdf")
+            media, err = _load_media(None, image_or_file, need_all_pages=True)
+            if err:
+                return f"❌ 加载文件失败: {err}"
+            pages = media if isinstance(media, list) else [media]
+        elif isinstance(image_or_file, list):
+            pages = image_or_file
+        elif image_or_file is not None:
+            pages = [image_or_file]
+
+        if not pages:
+            return "❌ 未获取到可识别的页面"
+
+        def _filter_pages_for_spec(all_pages, spec: str):
+            if not spec or str(spec).strip().lower() == "all":
+                return all_pages
+            indices = []
+            for part in str(spec).split(","):
+                part = part.strip()
+                if part.isdigit():
+                    idx = int(part) - 1
+                    if 0 <= idx < len(all_pages):
+                        indices.append(idx)
+            return [all_pages[i] for i in indices] if indices else all_pages
+
+        pages = _filter_pages_for_spec(pages, pdf_pages)
+
+        page_texts = []
+        for idx, page in enumerate(pages, 1):
+            try:
+                _, response, _ = self._run_inference(
+                    page,
+                    effective_prompt,
+                    max_tokens=2048,
+                    temperature=0.2,
+                    top_p=0.8,
+                    top_k=40,
+                    repetition_penalty=1.0,
+                )
+                cleaned = self._sanitize_markdown(response)
+            except Exception as e:
+                cleaned = f"⚠️ 第{idx}页识别失败: {e}"
+            page_texts.append(cleaned or "")
+
+        full_text = "\n\n".join(page_texts)
+
+        txt_file = os.path.join(output_dir, f"{input_filename}_ocr.txt")
+        md_file = os.path.join(output_dir, f"{input_filename}_ocr.md")
+        json_file = os.path.join(output_dir, f"{input_filename}_ocr.json")
+
+        try:
+            with open(txt_file, "w", encoding="utf-8") as f:
+                for i, text in enumerate(page_texts, 1):
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"第{i}页\n")
+                    f.write(f"{'='*60}\n\n")
+                    f.write(text)
+                    f.write("\n\n")
+        except Exception as e:
+            print(f"⚠️ 写入txt失败: {e}")
+
+        try:
+            with open(md_file, "w", encoding="utf-8") as f:
+                f.write(f"# {input_filename} OCR 结果（Qwen3）\n\n")
+                for i, text in enumerate(page_texts, 1):
+                    f.write(f"## 第{i}页\n\n")
+                    f.write(text)
+                    f.write("\n\n---\n\n")
+        except Exception as e:
+            print(f"⚠️ 写入md失败: {e}")
+
+        try:
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump({"engine": "qwen3", "pages": page_texts}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ 写入json失败: {e}")
+
+        elapsed_time = time.time() - start_time
+
+        result_markdown = f"## 文档OCR识别结果（Qwen3）\n\n"
+        result_markdown += f"**文件名：** {input_filename}\n"
+        result_markdown += f"**文件类型：** {'PDF' if is_pdf else '图片'}\n"
+        result_markdown += f"**识别页数：** {len(page_texts)}\n"
+        result_markdown += f"**处理时间：** {elapsed_time:.2f}秒\n\n"
+
+        result_markdown += f"### 📝 识别文本（第1页，共{len(page_texts)}页）\n\n"
+        if page_texts:
+            result_markdown += f"{page_texts[0][:1000]}{'...' if len(page_texts[0]) > 1000 else ''}\n\n"
+
+        result_markdown += "### 💾 保存的文件\n\n"
+        result_markdown += f"- **文本文件：** `{txt_file}`\n"
+        result_markdown += f"- **Markdown文件：** `{md_file}`\n"
+        result_markdown += f"- **JSON文件：** `{json_file}`\n"
+        result_markdown += "\n### 📚 知识库\n\n"
+        result_markdown += f"⏳ 正在对文本进行切片处理，完成后将自动保存到知识库。总字符数：{len(full_text)}\n"
+
+        self.last_ocr_text = full_text
+        self.last_ocr_page_texts = page_texts
+        self.last_ocr_markdown = result_markdown
+        self.last_ocr_output_dir = output_dir
+        self.last_ocr_files = {
+            "txt": txt_file,
+            "md": md_file,
+            "json": json_file,
+        }
+        self.last_ocr_html = "<h2>文档OCR识别结果</h2>" + self._render_sections_as_html(result_markdown)
+
+        try:
+            chunk_size = 1000 if len(full_text) > 100000 else 500
+            text_chunks = self._chunk_text_for_rag(full_text, chunk_size=chunk_size, max_chunks=500)
+            self.last_ocr_text_chunks = text_chunks
+            if self.doc_knowledge_base and full_text:
+                try:
+                    doc_id = self.doc_knowledge_base.add_document(
+                        text=full_text,
+                        filename=input_filename,
+                        chunks=text_chunks,
+                        metadata={
+                            "file_type": "PDF" if is_pdf else "图片",
+                            "page_count": len(page_texts),
+                            "ocr_time": elapsed_time,
+                            "engine": "qwen3",
+                        },
+                    )
+                    self.last_doc_id = doc_id
+                    print(f"✅ 文档已保存到知识库，ID: {doc_id}")
+                except Exception as e:
+                    print(f"⚠️ 保存到知识库失败: {e}")
+        except MemoryError as e:
+            print(f"⚠️ 内存不足，使用简化切片策略: {e}")
+            try:
+                text_chunks = self._chunk_text_for_rag(full_text, chunk_size=2000, overlap=100, max_chunks=200)
+                self.last_ocr_text_chunks = text_chunks
+                if self.doc_knowledge_base and full_text:
+                    try:
+                        doc_id = self.doc_knowledge_base.add_document(
+                            text=full_text,
+                            filename=input_filename,
+                            chunks=text_chunks,
+                            metadata={
+                                "file_type": "PDF" if is_pdf else "图片",
+                                "page_count": len(page_texts),
+                                "ocr_time": elapsed_time,
+                                "engine": "qwen3",
+                            },
+                        )
+                        self.last_doc_id = doc_id
+                        print(f"✅ 文档已保存到知识库，ID: {doc_id}")
+                    except Exception as e:
+                        print(f"⚠️ 保存到知识库失败: {e}")
+            except Exception:
+                self.last_ocr_text_chunks = [full_text[:50000]] if len(full_text) > 50000 else [full_text]
+        except Exception as e:
+            print(f"⚠️ 文本切片失败: {e}")
+            self.last_ocr_text_chunks = [full_text[:50000]] if len(full_text) > 50000 else [full_text]
+
+        return result_markdown
+
     def extract_document_fields_with_rag(self, key_fields, custom_prompt=None):
         """
         识别关键字段：根据关键字段对文本切片进行相似度映射，
@@ -5405,43 +5588,50 @@ def _legacy_create_unified_interface():
                         lines=3
                     )
             
-            with gr.Row(visible=False) as container_chatbot:
-                with gr.Group(elem_id="doc-upload-card"):
-                    gr.Markdown("#### 📂 上传文档并即时预览")
-                    with gr.Row(equal_height=True):
-                        with gr.Column(scale=1):
-                            media_file = gr.File(
-                                label="选择图片或PDF（取首页预览）",
-                                file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp"],
-                                type="filepath",
-                                height=90,
-                            )
-                            ocr_engine_selector = gr.Radio(
-                                label="文档OCR引擎",
-                                choices=["Qwen3-VL（本地）", "传统OCR识别"],
-                                value="Qwen3-VL（本地）",
-                                interactive=True,
-                                elem_id="doc-ocr-engine"
-                            )
-                            media_status = gr.Markdown(
-                                value="请上传文件，自动完成预览与OCR",
-                                elem_id="shared-status"
-                            )
-                            with gr.Column(
-                                scale=1,
-                                elem_id="doc-preview-column"
-                            ):
-                                media_preview = gr.Image(
-                                    label="预览（PDF取首页，顶部截取）",
-                                    type="pil",
-                                    interactive=False,
-                                    height=320,
-                                    elem_classes="doc-preview-image",
-                                )
-                                gr.Markdown(
-                                    "仅展示顶部内容，若需要全部可下载原文查看。",
-                                    elem_classes="text-xs",
-                                )
+            # 智能问答容器：整体纵向排布
+            with gr.Column(visible=False) as container_chatbot:
+                # ========= 第一行：左上传 + 右聊天 =========
+                with gr.Row():
+                    # 左侧：上传 & 预览
+                    with gr.Column(scale=1):
+                        with gr.Group(elem_id="doc-upload-card"):
+                            gr.Markdown("#### 📂 上传文档并即时预览")
+                            with gr.Row(equal_height=True):
+                                with gr.Column(scale=1):
+                                    media_file = gr.File(
+                                        label="选择图片或PDF（取首页预览）",
+                                        file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp"],
+                                        type="filepath",
+                                        height=90,
+                                    )
+                                    ocr_engine_selector = gr.Radio(
+                                        label="文档OCR引擎",
+                                        choices=["Qwen3-VL（本地）", "传统OCR识别"],
+                                        value="Qwen3-VL（本地）",
+                                        interactive=True,
+                                        elem_id="doc-ocr-engine"
+                                    )
+                                    media_status = gr.Markdown(
+                                        value="请上传文件，自动完成预览与OCR",
+                                        elem_id="shared-status"
+                                    )
+
+                                with gr.Column(
+                                    scale=1,
+                                    elem_id="doc-preview-column"
+                                ):
+                                    media_preview = gr.Image(
+                                        label="预览（PDF取首页，顶部截取）",
+                                        type="pil",
+                                        interactive=False,
+                                        height=320,
+                                        elem_classes="doc-preview-image",
+                                    )
+                                    gr.Markdown(
+                                        "仅展示顶部内容，若需要全部可下载原文查看。",
+                                        elem_classes="text-xs",
+                                    )
+
                             doc_ocr_preview = gr.HTML(
                                 label="自动OCR预览（上传即识别）",
                                 value="",
@@ -5449,34 +5639,68 @@ def _legacy_create_unified_interface():
                                 elem_id="doc-ocr-preview"
                             )
 
+                    # 右侧：图文问答
+                    with gr.Column(scale=2):
+                        with gr.Group(elem_id="unified-chat-panel"):
+                            gr.Markdown("### 图文问答")
+                            doc_chatbot = gr.Chatbot(
+                                label=None,
+                                height=520,
+                                show_label=False,
+                                type="tuples",
+                                elem_id="unified-chatbot",
+                                render_markdown=True
+                            )
+                            doc_text_input = gr.Textbox(
+                                label=None,
+                                placeholder="输入你想了解的内容，支持直接就文档/图片发问。",
+                                lines=3,
+                                elem_id="unified-query"
+                            )
+                            with gr.Row():
+                                doc_send_btn = gr.Button("发送", variant="primary", scale=1)
+                                doc_clear_btn = gr.Button("🗑️ 清空历史", variant="secondary", scale=1)
+                            doc_stats_output = gr.HTML(
+                                value="",
+                                visible=False,
+                                elem_id="unified-stats"
+                            )
+
+                # 绑定上传回调（放在组件定义之后即可）
                 media_file.change(
                     on_media_upload,
                     inputs=[media_file, ocr_engine_selector],
                     outputs=[media_preview, media_image_state, media_file_state, media_status, doc_ocr_preview],
                 )
 
-                with gr.Row(equal_height=True):
-                    with gr.Column(scale=2):
-                        with gr.Group(elem_id="unified-chat-panel"):
-                            gr.Markdown("### 图文问答")
-                            doc_chatbot = gr.Chatbot(label=None, height=520, show_label=False, type="tuples", elem_id="unified-chatbot", render_markdown=True)
-                            doc_text_input = gr.Textbox(label=None, placeholder="输入你想了解的内容，支持直接就文档/图片发问。", lines=3, elem_id="unified-query")
-                            with gr.Row():
-                                doc_send_btn = gr.Button("发送", variant="primary", scale=1)
-                                doc_clear_btn = gr.Button("🗑️ 清空历史", variant="secondary", scale=1)
-                            doc_stats_output = gr.HTML(value="", visible=False, elem_id="unified-stats")
+                # ========= 第二行：底部参数配置（整行） =========
+                with gr.Row():
+                    with gr.Column():
+                        with gr.Accordion("🔧 参数配置", open=False, elem_id="unified-params"):
+                            # 可以不再用 Row，让每个 slider 独占一行，会更整齐
+                            max_tokens = gr.Slider(
+                                minimum=512, maximum=16384, value=4096,
+                                label="最大生成长度 (out_seq_length)"
+                            )
+                            temperature = gr.Slider(
+                                minimum=0.0, maximum=2.0, value=0.7,
+                                label="创造性 (temperature)"
+                            )
 
-                with gr.Accordion("🔧 参数配置", open=False, elem_id="unified-params"):
-                    with gr.Row(equal_height=True):
-                        max_tokens = gr.Slider(minimum=512, maximum=16384, value=4096, label="最大生成长度 (out_seq_length)")
-                        temperature = gr.Slider(minimum=0.0, maximum=2.0, value=0.7, label="创造性 (temperature)")
-                    gr.Markdown("ℹ️ 上方上传并自动预览/识别，直接在此提问即可。")
+                            gr.Markdown("ℹ️ 上方上传并自动预览/识别，直接在此提问即可。")
 
-                    with gr.Accordion("🎛️ 高级参数", open=False, visible=True):
-                        top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.8, label="top_p")
-                        top_k = gr.Slider(minimum=0, maximum=100, value=20, label="top_k")
-                        repetition_penalty = gr.Slider(minimum=0.8, maximum=2.0, value=1.0, step=0.05, label="repetition_penalty")
-                        presence_penalty = gr.Slider(minimum=0.0, maximum=3.0, value=1.5, step=0.1, label="presence_penalty")
+                            with gr.Accordion("🎛️ 高级参数", open=False, visible=True):
+                                top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.8, label="top_p")
+                                top_k = gr.Slider(minimum=0, maximum=100, value=20, label="top_k")
+                                repetition_penalty = gr.Slider(
+                                    minimum=0.8, maximum=2.0, value=1.0, step=0.05,
+                                    label="repetition_penalty"
+                                )
+                                presence_penalty = gr.Slider(
+                                    minimum=0.0, maximum=3.0, value=1.5, step=0.1,
+                                    label="presence_penalty"
+                                )
+
                 doc_send_btn.click(
                     handle_unified_chat,
                     inputs=[media_image_state, media_file_state, doc_text_input, doc_chatbot, max_tokens, temperature, top_p, top_k, pro_task_state, repetition_penalty, presence_penalty],
