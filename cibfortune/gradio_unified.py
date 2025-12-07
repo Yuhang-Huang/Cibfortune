@@ -778,6 +778,7 @@ class AdvancedQwen3VLApp:
             )
             
             result = self.card_api.recognize_card(
+                image,
                 image_sr,
                 custom_prompt=type_prompt,
                 use_rag=False,
@@ -816,6 +817,7 @@ class AdvancedQwen3VLApp:
 
                 guess_result = self.card_api.recognize_card(
                     image,
+                    image_sr,
                     custom_prompt=guess_prompt,
                     use_rag=False,
                     max_tokens=1000,
@@ -872,7 +874,8 @@ class AdvancedQwen3VLApp:
                 "只输出票据类型，不要输出其他内容。"
             )
             
-            result = self.bill_api.recognize_card(
+            result = self.bill_api.recognize_card(  
+                image,
                 image_sr,
                 custom_prompt=type_prompt,
                 use_rag=False,
@@ -914,6 +917,7 @@ class AdvancedQwen3VLApp:
 
                 guess_result = self.bill_api.recognize_card(
                     image,
+                    image_sr,
                     custom_prompt=guess_prompt,
                     use_rag=False,
                     max_tokens=1000,
@@ -1026,6 +1030,7 @@ class AdvancedQwen3VLApp:
             use_rag = (self.current_card_type == "银行卡")
             
             result = self.card_api.recognize_card(
+                image,
                 image_sr,
                 custom_prompt=custom_prompt,
                 use_rag=use_rag,
@@ -1226,6 +1231,7 @@ class AdvancedQwen3VLApp:
             max_tokens = 8192  # 最小2048，最大8192
             
             result = self.bill_api.recognize_card(
+                image,
                 image_sr,
                 custom_prompt=custom_prompt,
                 use_rag=use_rag,
@@ -1953,6 +1959,7 @@ class AdvancedQwen3VLApp:
             effective_prompt = (prompt or "").strip() or default_prompt
             result = self.card_api.recognize_card(
                 image,
+                image_sr,
                 custom_prompt=effective_prompt,
                 use_rag=True,
             )
@@ -3053,6 +3060,7 @@ class AdvancedQwen3VLApp:
                 # 调用API进行信息抽取
                 api_result = self.doc_api.recognize_card(
                     image=image_for_api,
+                    image_sr=image_sr,
                     custom_prompt=effective_prompt,
                     max_tokens=2048,
                     temperature=0.2,

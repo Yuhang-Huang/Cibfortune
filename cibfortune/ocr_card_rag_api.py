@@ -391,7 +391,7 @@ class CardOCRWithRAG:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "qwen-vl-plus",
+        model: str = "qwen3-vl-plus",
         base_url: Optional[str] = None,
         rag_image_dir: str = "rag_cards",
         persist_directory: str = "./multimodal_chroma_card",
@@ -703,6 +703,7 @@ class CardOCRWithRAG:
     def recognize_card(
         self,
         image: Image.Image,
+        image_sr: Image.Image,
         custom_prompt: Optional[str],
         max_tokens: int = 1024,
         temperature: float = 0.3,
@@ -941,32 +942,32 @@ class CardOCRWithRAG:
                 "generation_time": 0
             }
 
-    def recognize_from_file(
-        self,
-        image_path: str,
-        **kwargs
-    ) -> Dict:
-        """
-        从文件路径识别卡证
+    # def recognize_from_file(
+    #     self,
+    #     image_path: str,
+    #     **kwargs
+    # ) -> Dict:
+    #     """
+    #     从文件路径识别卡证
         
-        Args:
-            image_path: 图片文件路径
-            **kwargs: 传递给recognize_card的其他参数
+    #     Args:
+    #         image_path: 图片文件路径
+    #         **kwargs: 传递给recognize_card的其他参数
             
-        Returns:
-            识别结果字典
-        """
-        try:
-            image = Image.open(image_path)
-            return self.recognize_card(image, **kwargs)
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"图片加载失败: {str(e)}",
-                "result": None,
-                "rag_info": None,
-                "generation_time": 0
-            }
+    #     Returns:
+    #         识别结果字典
+    #     """
+    #     try:
+    #         image = Image.open(image_path)
+    #         return self.recognize_card(image, **kwargs)
+    #     except Exception as e:
+    #         return {
+    #             "success": False,
+    #             "error": f"图片加载失败: {str(e)}",
+    #             "result": None,
+    #             "rag_info": None,
+    #             "generation_time": 0
+    #         }
 
 
 def main():
@@ -983,7 +984,7 @@ def main():
     # 创建识别器实例（会自动使用环境变量中的 API key）
     ocr = CardOCRWithRAG(
         api_key=None,
-        model="qwen-vl-plus",  # 或使用 "qwen-vl-max", "qwen-vl-max-longcontext"
+        model="qwen3-vl-plus",  # 或使用 "qwen-vl-max", "qwen-vl-max-longcontext"
         rag_image_dir="rag_cards",
         persist_directory="./multimodal_chroma_card",
         use_api=use_api
