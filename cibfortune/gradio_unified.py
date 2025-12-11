@@ -3060,7 +3060,7 @@ class AdvancedQwen3VLApp:
                 # 调用API进行信息抽取
                 api_result = self.doc_api.recognize_card(
                     image=image_for_api,
-                    image_sr=image_sr,
+                    image_sr=image_for_api,
                     custom_prompt=effective_prompt,
                     max_tokens=2048,
                     temperature=0.2,
@@ -5456,8 +5456,6 @@ def _legacy_create_unified_interface():
                 return ""
             
             def sync2_edited_html(html_content):
-                print("bill_ocr_result_html.change!!")
-                print(html_content)
                 if html_content:
                     return html_content
                 return ""
